@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { Plus, StickyNote, X } from 'lucide-vue-next'
-import type { Note } from '../api/tauri'
+import type { Note, Tag } from '../api/tauri'
 import { useStore } from '../stores/workbench'
 import { markdownPlainText } from '../utils/markdown'
 import { parseTimestamp } from '../utils/time'
+import ConfirmDialog from './ConfirmDialog.vue'
 
 const props = defineProps<{
   notes: readonly Note[]
@@ -23,7 +24,7 @@ const store = useStore()
 const activeTagId = ref<number | null>(null)
 const tagMap = ref<Map<number, number[]>>(new Map()) // note_id -> tag_ids
 
-onMounted(async () => {
+async function refreshTagMap() {
   const rows = await store.loadNoteTagsMap()
   const map = new Map<number, number[]>()
   for (const row of rows) {
@@ -32,7 +33,30 @@ onMounted(async () => {
     map.set(row.note_id, list)
   }
   tagMap.value = map
+}
+
+onMounted(() => {
+  void refreshTagMap()
 })
+
+// ---- 删除标签（仿待办模块：chip 上的 × → 确认 → 全局删除并摘除关联） ----
+const removingTag = ref<Tag | null>(null)
+
+async function removeTag(id: number) {
+  try {
+    await store.deleteTag(id)
+    if (activeTagId.value === id) activeTagId.value = null
+    await refreshTagMap()
+  } catch (e) {
+    console.error('删除标签失败', e)
+  }
+}
+
+function confirmRemoveTag() {
+  const tag = removingTag.value
+  removingTag.value = null
+  if (tag) void removeTag(tag.id)
+}
 
 const sortedNotes = computed(() => {
   const list = [...props.notes].sort(
@@ -77,7 +101,7 @@ function summary(n: Note): string {
       </button>
     </header>
 
-    <!-- 标签筛选（横向滚动） -->
+    <!-- 标签筛选（自动换行，不再横向溢出） -->
     <nav v-if="store.state.tags.length > 0" class="filter-tabs tag-filter" aria-label="标签筛选">
       <button
         class="filter-tab filter-tab--tag"
@@ -93,9 +117,28 @@ function summary(n: Note): string {
         :class="{ active: activeTagId === t.id }"
         @click="activeTagId = t.id"
       >
-        {{ t.name }}
+        <span class="tag-name">{{ t.name }}</span>
+        <span
+          class="tag-x"
+          title="删除该标签"
+          :aria-label="`删除标签「${t.name}」`"
+          @click.stop="removingTag = t"
+        >
+          <X :size="9" :stroke-width="2.5" />
+        </span>
       </button>
     </nav>
+
+    <ConfirmDialog
+      :visible="removingTag != null"
+      title="删除标签"
+      :message="`「${removingTag?.name ?? ''}」会从所有笔记上摘掉，标签本身也会删除。`"
+      hint="这个操作不能撤销。"
+      tone="danger"
+      confirm-text="删除标签"
+      @confirm="confirmRemoveTag"
+      @cancel="removingTag = null"
+    />
 
     <div v-if="sortedNotes.length > 0" class="nl-body">
       <div
@@ -178,10 +221,37 @@ function summary(n: Note): string {
   gap: 4px;
 }
 
-/* 标签筛选条 */
+/* 标签筛选条：换行显示，标签多时全部可见，不再横向溢出 */
 .tag-filter {
   padding: 0 4px 8px;
   margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.filter-tab--tag .tag-name {
+  max-width: 12em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filter-tab--tag .tag-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-right: -4px;
+  border-radius: 50%;
+  opacity: 0;
+  color: var(--text-4);
+  transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+.filter-tab--tag:hover .tag-x,
+.filter-tab--tag .tag-x:focus-visible {
+  opacity: 1;
+}
+.filter-tab--tag .tag-x:hover {
+  color: var(--c-red);
+  background: color-mix(in srgb, var(--c-red) 12%, transparent);
 }
 .note-item {
   position: relative;

@@ -874,6 +874,18 @@ function removeTag(tagId: number) {
   void persistTags()
 }
 
+// 标签被全局删除（列表筛选栏 ×）后，同步摘掉底栏残留的已删标签
+watch(
+  () => store.state.tags.map((t) => t.id).join(','),
+  () => {
+    if (noteTags.value.length === 0) return
+    const alive = new Set(store.state.tags.map((t) => t.id))
+    if (noteTags.value.some((t) => !alive.has(t.id))) {
+      noteTags.value = noteTags.value.filter((t) => alive.has(t.id))
+    }
+  },
+)
+
 async function submitTagInput() {
   const name = tagInput.value.trim()
   if (!name) {
