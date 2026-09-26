@@ -57,7 +57,8 @@
 
 - `data.*` 中方法名以 `create/update/delete/set/toggle/reorder/import/schedule` 开头 → `data:write`，其余 → `data:read`
 - `ui.*` → `notify`｜`net.*` → `network`｜`system.*` → `system`｜`clipboard.*` → `clipboard`｜`fs.*` → `fs`｜`sharedStorage.*` → `shared-storage`｜`events.emit` → `events`
-- `runtime.*` / `storage.*` / `config.*` / `theme.*` / `service.*` / `expose` → 无需权限
+- **`xhub.openExternal(...)`（顶层方法）→ `open-url`**；其余 `runtime.*` 无需权限
+- `runtime.*`（`openExternal` 除外）/ `storage.*` / `config.*` / `theme.*` / `service.*` / `expose` → 无需权限
 
 ⚠️ 扫描是**纯文本匹配**，所以**注释、字符串、示例代码里写的 `xhub.data.notes.create(...)` 也会被算作「用到了」**——要么补声明，要么别在注释里写这种调用示例。
 
@@ -73,6 +74,7 @@
 
 **不用手改清单**：客户端「扩展中心」里对「开发中」的扩展点「**发布**」→ 客户端本地预检（上面那张表）→ 打包上传 → 平台**机器关卡**（包结构 / manifest / 入口 / 权限申报 / 静态扫描 / 版本递增）→ **人工审核** → 签名上架，已装用户自动收到更新；被拒时客户端「我的提交」里能看到逐项理由。
 
+- **版本号不用手改 manifest**：发布弹窗的「发布版本」默认预填「当前补丁号 +1」，点发布时客户端会先把该版本写回扩展的 `manifest.json` 再打包（必须大于当前版本；留空则按 manifest 当前版本发布，适合关卡挂了重提同一版）。改完代码 → 点发布 → 直接发布，全程不必去扩展目录手改文件。
 - 发布时可**上传截图**（最多 5 张、单张 ≤2MB，PNG/JPG/WebP），会展示在扩展详情页——建议传 1~3 张（主界面 + 典型用法）。
 - 发布需要**发布者身份**：设置 →「账号」登录 → 兑换邀请码 → 申请成为开发者 → 审核通过后，「开发中」的扩展才会出现「发布」按钮。
 

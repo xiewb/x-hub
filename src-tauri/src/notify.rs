@@ -61,7 +61,8 @@ pub fn init(app: &AppHandle) {
 
 fn build_window(app: &AppHandle) -> Result<WebviewWindow, String> {
     let mut builder =
-        WebviewWindowBuilder::new(app, NOTICE_LABEL, WebviewUrl::App("index.html".into()))
+        // 轻量入口 notice.html（P2）：只渲染通知卡片，不加载完整 SPA（内存优化，见 src/light/notice.ts）
+        WebviewWindowBuilder::new(app, NOTICE_LABEL, WebviewUrl::App("notice.html".into()))
             .title("通知")
             .inner_size(NOTICE_WIDTH, NOTICE_DEFAULT_HEIGHT)
             .resizable(false)
@@ -146,7 +147,15 @@ pub fn show_notice(app: &AppHandle, kind: &str, title: &str, body: &str) {
         // 首帧：先定位 + 显示（不依赖隐藏 WebView2 处理事件的时序），高度随后校正
         anchor_default_and_show(&win);
     }
-    let payload = serde_json::json!({ "kind": kind, "title": title, "body": body });
+    // 驻留时长随每条通知一起下发（设置 → 常规可调）：通知窗是启动期预创建、常驻不重启的，
+    // 若让前端自己读一次配置，改了设置也得等下次启动才生效
+    let duration_ms = crate::config::load().notice_duration_ms.clamp(1000, 60_000);
+    let payload = serde_json::json!({
+        "kind": kind,
+        "title": title,
+        "body": body,
+        "durationMs": duration_ms
+    });
     if let Err(e) = app.emit_to(NOTICE_LABEL, "notice-new", &payload) {
         log::warn!("通知事件投递失败: {e}");
     }
@@ -297,6 +306,8 @@ fn anchor_bottom_right(win: &WebviewWindow, width_logical: f64, height_logical: 
 /// 无激活显示：加 WS_EX_NOACTIVATE 后 SW_SHOWNA——通知不该抢走用户当前输入焦点。
 #[cfg(target_os = "windows")]
 fn show_no_activate(win: &WebviewWindow) {
+    // 先恢复内存级别再显示（webview_mem：Low 态缓存已吐，通知首帧前回 Normal）
+    crate::webview_mem::on_shown(win.app_handle(), win.label());
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_SHOWNA, WS_EX_NOACTIVATE,
     };
@@ -315,6 +326,8 @@ fn show_no_activate(win: &WebviewWindow) {
 
 #[cfg(target_os = "windows")]
 fn hide_window(win: &WebviewWindow) {
+    // 隐藏后把常驻 renderer 的内存目标级别降到 Low（webview_mem，轮询兜底）
+    crate::webview_mem::on_hidden(win.app_handle(), win.label());
     use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
     if let Ok(hwnd) = win.hwnd() {
         unsafe {
