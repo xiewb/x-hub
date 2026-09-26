@@ -348,10 +348,31 @@ export function useStore() {
     state.notes = state.notes.filter((x) => x.id !== id)
   }
 
-  /** 剪贴板浮层等外部保存速记后，主窗口刷新笔记列表（仅拉元信息，轻量） */
+  /**
+   * 剪贴板浮层保存速记、垃圾箱恢复等外部变更后，刷新笔记列表。
+   * list_notes 仅拉元信息（content 为空串），直接整体替换会把 state 里全部正文清掉，
+   * 之后任何一次编辑都会把空正文写回数据库（内容永久丢失）。
+   * 因此合并式刷新：已有笔记保留本地正文，新出现的 id 单独按 id 补拉全文。
+   */
   async function refreshNotes() {
     if (!isTauri()) return
-    state.notes = await tauriApi.listNotes()
+    const fresh = await tauriApi.listNotes()
+    const prev = new Map(state.notes.map((n) => [n.id, n]))
+    const merged: Note[] = []
+    for (const n of fresh) {
+      const old = prev.get(n.id)
+      if (old) {
+        merged.push({ ...n, content: old.content })
+      } else {
+        try {
+          merged.push(await tauriApi.getNote(n.id))
+        } catch (e) {
+          console.error('拉取笔记全文失败，先以元信息展示', n.id, e)
+          merged.push(n)
+        }
+      }
+    }
+    state.notes = merged
   }
 
   async function searchAll(keyword: string) {

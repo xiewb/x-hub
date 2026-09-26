@@ -1,21 +1,60 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch, type Component } from 'vue'
 import { Crepe } from '@milkdown/crepe'
 import '@milkdown/crepe/theme/common/style.css'
 import '@milkdown/crepe/theme/frame.css'
 import { editorViewCtx } from '@milkdown/kit/core'
 import type { Ctx } from '@milkdown/kit/ctx'
 import { imageBlockSchema } from '@milkdown/kit/component/image-block'
-import { codeBlockSchema } from '@milkdown/kit/preset/commonmark'
+import { codeBlockSchema, remarkLineBreak } from '@milkdown/kit/preset/commonmark'
 import { createTable } from '@milkdown/kit/preset/gfm'
 import { Fragment, type Node as ProseNode, type Schema } from '@milkdown/kit/prose/model'
 import type { EditorView } from '@milkdown/kit/prose/view'
 import { NodeSelection, TextSelection, type EditorState } from '@milkdown/kit/prose/state'
-import { Tag as TagIcon, Trash2, X } from 'lucide-vue-next'
+import { callCommand } from '@milkdown/kit/utils'
+import { undoCommand, redoCommand } from '@milkdown/kit/plugin/history'
+import { undo as cmUndo, redo as cmRedo } from '@codemirror/commands'
+import {
+  Bold,
+  Code,
+  Heading1,
+  Heading2,
+  Heading3,
+  Highlighter,
+  Italic,
+  Link2,
+  List,
+  ListOrdered,
+  ListTree,
+  ListTodo,
+  Minus,
+  Quote,
+  Redo2,
+  SquareCode,
+  Strikethrough,
+  Tag as TagIcon,
+  Trash2,
+  Undo2,
+  X,
+} from 'lucide-vue-next'
 import { isTauri, tauriApi, type Note, type Tag } from '../api/tauri'
 import { useStore } from '../stores/workbench'
 import { attachBlockDrag } from '../utils/blockDrag'
 import { expandOnEnter, matchWysiwygLine, type LineShortcut } from '../utils/markdownEnter'
+import { forkHighlightRemark, highlightMark } from '../utils/forkHighlight'
+import CodeMirrorSource from './CodeMirrorSource.vue'
+import FindReplaceBar from './FindReplaceBar.vue'
+import {
+  collectMatches,
+  currentMatchIndex,
+  gotoMatch,
+  replaceMatch,
+  replaceAllInView,
+  countStringMatches,
+  countStringMatchesBefore,
+  type FindQuery,
+} from '../utils/proseFind'
+import { SearchQuery } from '@codemirror/search'
 import { loosenHtmlBreaks, renderNoteMarkdown, restoreCrepeMarkdown } from '../utils/markdownHtml'
 import { deriveNoteTitle } from '../utils/markdown'
 import { NOTE_EDITOR_MODES, normalizeNoteEditorMode, type NoteEditorMode } from '../utils/noteEditorMode'
@@ -49,7 +88,10 @@ const store = useStore()
 const mode = ref<NoteEditorMode>(normalizeNoteEditorMode(store.state.config.note_editor_mode))
 
 const rootEl = ref<HTMLDivElement>()
-const splitSourceEl = ref<HTMLTextAreaElement | null>(null)
+type CmSourceInst = InstanceType<typeof CodeMirrorSource>
+const splitSourceEl = ref<CmSourceInst | null>(null)
+/** 实时源码模式的 textarea（工具栏变换需要选区） */
+const sourceEl = ref<CmSourceInst | null>(null)
 const previewEl = ref<HTMLDivElement | null>(null)
 let splitResize: ResizeObserver | null = null
 
@@ -69,6 +111,7 @@ const previewHtml = computed(() => renderNoteMarkdown(localContent.value))
 // ---- 生命周期 ----
 onBeforeUnmount(() => {
   flushPendingSave()
+  stopOutlineTimer()
   detachImageListeners()
   // 防御：卸载瞬间可能仍在拖拽/预览中
   window.removeEventListener('pointermove', onResizeMove)
@@ -198,6 +241,12 @@ async function mountEditor(content: string) {
         },
       },
     })
+    // 单换行修复：让段落内 text 的 \n 解析为 hardbreak（视觉换行），
+    // 序列化仍输出干净的单换行（stringify 不跑 transformer，round-trip 无损），
+    // 与实时预览 marked {breaks:true} 的语义保持一致，消除源码↔预览来回切换产生的空行
+    c.editor.use(remarkLineBreak)
+    // ==高亮== 扩展（fork）：remark 双向 transformer + mark schema
+    c.editor.use(forkHighlightRemark).use(highlightMark)
     await c.create()
     if (!rootEl.value || (props.note?.id ?? null) !== wantId) {
       // create 期间笔记已切换/组件已卸载：本次实例作废，队列重挂最新笔记（不挂监听、不接管拖拽）
@@ -377,15 +426,19 @@ function flushLeavingNote(id: number) {
   emit('save', id, normalizeTitle(localTitle.value), localContent.value)
 }
 
-function onSourceInput(e: Event) {
-  const value = (e.target as HTMLTextAreaElement).value
+/** CM updateListener → 防抖保存链路（与旧 textarea input 事件语义一致） */
+function onSourceInput(value: string) {
   adoptMarkdown(value)
   if (mode.value === 'split') void nextTick(syncPreviewScroll)
 }
 
+
+
+
+
 /** 分屏时右边预览按左边源码的滚动比例跟着走。两边高度不同，对齐的是滚动条位置而不是某一行。 */
 function syncPreviewScroll() {
-  const source = splitSourceEl.value
+  const source = splitSourceEl.value?.view?.scrollDOM
   const preview = previewEl.value
   if (!source || !preview) return
   const sourceMax = source.scrollHeight - source.clientHeight
@@ -396,29 +449,15 @@ function syncPreviewScroll() {
 watch([splitSourceEl, previewEl], () => {
   splitResize?.disconnect()
   splitResize = null
-  const source = splitSourceEl.value
+  const source = splitSourceEl.value?.view?.scrollDOM
   const preview = previewEl.value
   if (!source || !preview) return
   splitResize = new ResizeObserver(() => syncPreviewScroll())
   splitResize.observe(source)
   splitResize.observe(preview)
+  source.addEventListener('scroll', syncPreviewScroll, { passive: true })
   syncPreviewScroll()
 })
-
-/** 行尾回车补上代码块、公式、图片、表格。光标留在新结构里。 */
-function onSourceKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || e.defaultPrevented) return
-  const el = e.target
-  if (!(el instanceof HTMLTextAreaElement) || el.selectionStart !== el.selectionEnd) return
-  const expanded = expandOnEnter(el.value, el.selectionStart)
-  if (!expanded) return
-  e.preventDefault()
-  adoptMarkdown(expanded.value)
-  void nextTick(() => {
-    el.setSelectionRange(expanded.cursor, expanded.cursor)
-    if (mode.value === 'split') syncPreviewScroll()
-  })
-}
 
 /**
  * 实时预览里 Milkdown 要在标记后面加空格才变成对应节点，单独回车只是换行。
@@ -857,6 +896,455 @@ watch(
   },
 )
 
+// ---- 格式工具栏：三模式通用的 Markdown 文本变换 ----
+type MdAction =
+  | 'bold'
+  | 'italic'
+  | 'strike'
+  | 'code'
+  | 'highlight'
+  | 'link'
+  | 'h1'
+  | 'h2'
+  | 'h3'
+  | 'ul'
+  | 'ol'
+  | 'task'
+  | 'quote'
+  | 'codeblock'
+  | 'hr'
+  | 'undo'
+  | 'redo'
+
+const WRAP_ACTIONS: Partial<Record<MdAction, [string, string, string]>> = {
+  highlight: ['==', '==', '高亮文本'],
+  bold: ['**', '加粗文字', '**'],
+  italic: ['*', '斜体文字', '*'],
+  strike: ['~~', '删除文字', '~~'],
+  code: ['`', '代码', '`'],
+  link: ['[', '链接文字', '](https://)'],
+}
+
+const PREFIX_ACTIONS: Partial<Record<MdAction, string>> = {
+  h1: '# ',
+  h2: '## ',
+  h3: '### ',
+  ul: '- ',
+  task: '- [ ] ',
+  quote: '> ',
+}
+
+/** 对 Markdown 源文本做包裹/行前缀变换，返回新文本与建议选区 */
+function transformMarkdown(
+  src: string,
+  selStart: number,
+  selEnd: number,
+  action: MdAction,
+): { text: string; selStart: number; selEnd: number } {
+  // 包裹类：选中则包裹，已包裹则取消，无选中插入占位
+  const wrap = WRAP_ACTIONS[action]
+  if (wrap) {
+    const [open, placeholder, close] = wrap
+    const hasSel = selEnd > selStart
+    const selected = src.slice(selStart, selEnd)
+    if (
+      hasSel &&
+      src.slice(Math.max(0, selStart - open.length), selStart) === open &&
+      src.slice(selEnd, selEnd + close.length) === close
+    ) {
+      const text =
+        src.slice(0, selStart - open.length) + selected + src.slice(selEnd + close.length)
+      return { text, selStart: selStart - open.length, selEnd: selEnd - open.length }
+    }
+    const body = hasSel ? selected : placeholder
+    const insert = open + body + close
+    const text = src.slice(0, selStart) + insert + src.slice(selEnd)
+    return { text, selStart: selStart + open.length, selEnd: selStart + open.length + body.length }
+  }
+
+  // 分割线：文档末尾追加水平线
+  if (action === 'hr') {
+    const base = src.length > 0 && !src.endsWith('\n') ? src + '\n' : src
+    const text = base + '\n---\n'
+    return { text, selStart: text.length, selEnd: text.length }
+  }
+
+  // 代码块：选中内容用围栏包住
+  if (action === 'codeblock') {
+    const body = src.slice(selStart, selEnd) || '代码块'
+    const insert = '```\n' + body + '\n```'
+    const text = src.slice(0, selStart) + insert + src.slice(selEnd)
+    return { text, selStart: selStart + 4, selEnd: selStart + 4 + body.length }
+  }
+
+  // 行前缀类（标题/列表/引用）：作用于选区覆盖的所有行；再按一次取消
+  if (action === 'ol') {
+    const ls = src.lastIndexOf('\n', selStart - 1) + 1
+    let le = src.indexOf('\n', selEnd)
+    if (le === -1) le = src.length
+    const lines = src.slice(ls, le).split('\n')
+    let at = 0
+    const numbered = lines.map((l) => {
+      if (l.trim() === '' && lines.length > 1) return l
+      at += 1
+      return at + '. ' + l.replace(/^\s*(-|\*|\d+\.)\s+/, '')
+    })
+    const newBlock = numbered.join('\n')
+    const text = src.slice(0, ls) + newBlock + src.slice(le)
+    return { text, selStart: ls, selEnd: ls + newBlock.length }
+  }
+  const prefix = PREFIX_ACTIONS[action]
+  if (prefix) {
+    const ls = src.lastIndexOf('\n', selStart - 1) + 1
+    let le = src.indexOf('\n', selEnd)
+    if (le === -1) le = src.length
+    const lines = src.slice(ls, le).split('\n')
+    const allHave = lines.every((l) => l.startsWith(prefix) || l.trim() === '')
+    const changed = lines.map((l) => {
+      if (l.trim() === '' && lines.length > 1) return l
+      if (allHave) return l.startsWith(prefix) ? l.slice(prefix.length) : l
+      // 去掉已有的其他列表/引用标记，避免叠加
+      return prefix + l.replace(/^\s*(-\s\[[ x]\]\s|[-*]\s|\d+\.\s|>\s)/, '')
+    })
+    const newBlock = changed.join('\n')
+    const text = src.slice(0, ls) + newBlock + src.slice(le)
+    return { text, selStart: ls, selEnd: ls + newBlock.length }
+  }
+  return { text: src, selStart, selEnd }
+}
+
+// ---- 查找替换（三模式路由：wysiwyg→ProseMirror 事务，source/split 左栏→CM search API）----
+const findVisible = ref(false)
+const findWithReplace = ref(false)
+const findSearch = ref('')
+const findReplace = ref('')
+const findCase = ref(false)
+const findRegexp = ref(false)
+const findTotal = ref(0)
+const findCurrent = ref(0)
+
+function findQuery(): FindQuery {
+  return { search: findSearch.value, caseSensitive: findCase.value, regexp: findRegexp.value }
+}
+
+function cmSearchQuery(): SearchQuery {
+  const q = findQuery()
+  return new SearchQuery({ search: q.search, replace: findReplace.value, caseSensitive: q.caseSensitive, regexp: q.regexp })
+}
+
+/** 源码/分屏左栏的 CM 实例（wysiwyg 下为 null） */
+function activeCm(): CmSourceInst | null {
+  return mode.value === 'split' ? splitSourceEl.value : sourceEl.value
+}
+
+/** Crepe 的 ProseMirror view（未挂载/已销毁时 null） */
+function pmView(): EditorView | null {
+  if (!crepe) return null
+  let v: EditorView | null = null
+  crepe.editor.action((ctx) => {
+    v = ctx.get(editorViewCtx)
+  })
+  return v
+}
+
+/** 重算匹配计数（query 变化/跳转/替换后调用） */
+function refreshFindCount() {
+  if (!findVisible.value) return
+  const q = findQuery()
+  if (!q.search) {
+    findTotal.value = 0
+    findCurrent.value = 0
+    return
+  }
+  if (mode.value === 'wysiwyg') {
+    const view = pmView()
+    if (!view) return
+    const matches = collectMatches(view.state, q)
+    findTotal.value = matches.length
+    const idx = currentMatchIndex(matches, view.state)
+    findCurrent.value = idx >= 0 ? idx + 1 : matches.length ? 1 : 0
+  } else {
+    const cm = activeCm()
+    const view = cm?.view
+    if (!view) return
+    const text = view.state.doc.toString()
+    findTotal.value = countStringMatches(text, q)
+    const sel = view.state.selection.main
+    findCurrent.value = sel.empty
+      ? 0
+      : Math.min(countStringMatchesBefore(text, q, sel.from) + 1, findTotal.value || 1)
+  }
+}
+
+/** wysiwyg：从光标处向后定位下一个匹配（无则回绕），thenStart 时从头开始 */
+function pmStep(dir: 1 | -1) {
+  const view = pmView()
+  if (!view) return
+  const matches = collectMatches(view.state, findQuery())
+  findTotal.value = matches.length
+  if (!matches.length) {
+    findCurrent.value = 0
+    return
+  }
+  let idx: number
+  if (dir === 1) {
+    idx = matches.findIndex((m) => m.from >= view.state.selection.to)
+    if (idx === -1) idx = 0
+  } else {
+    idx = -1
+    for (let i = matches.length - 1; i >= 0; i--) {
+      if (matches[i].to <= view.state.selection.from) {
+        idx = i
+        break
+      }
+    }
+    if (idx === -1) idx = matches.length - 1
+  }
+  gotoMatch(view, matches[idx])
+  findCurrent.value = idx + 1
+}
+
+function onFindSearch(v: string) {
+  findSearch.value = v
+  if (mode.value !== 'wysiwyg') activeCm()?.applySearchQuery(cmSearchQuery())
+  if (mode.value === 'wysiwyg') {
+    // 新 query：光标归到选区起点，避免 next 跳过当前位置
+    const view = pmView()
+    if (view) view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, view.state.selection.from)))
+  }
+  refreshFindCount()
+}
+
+function onFindReplace(v: string) {
+  findReplace.value = v
+  if (mode.value !== 'wysiwyg') activeCm()?.applySearchQuery(cmSearchQuery())
+}
+
+function onFindCase(v: boolean) {
+  findCase.value = v
+  if (mode.value !== 'wysiwyg') activeCm()?.applySearchQuery(cmSearchQuery())
+  refreshFindCount()
+}
+
+function onFindRegexp(v: boolean) {
+  findRegexp.value = v
+  if (mode.value !== 'wysiwyg') activeCm()?.applySearchQuery(cmSearchQuery())
+  refreshFindCount()
+}
+
+function onFindNext() {
+  if (mode.value === 'wysiwyg') pmStep(1)
+  else {
+    activeCm()?.findNextMatch()
+    refreshFindCount()
+  }
+}
+
+function onFindPrev() {
+  if (mode.value === 'wysiwyg') pmStep(-1)
+  else {
+    activeCm()?.findPrevMatch()
+    refreshFindCount()
+  }
+}
+
+function onFindReplaceOne() {
+  const text = findReplace.value
+  if (mode.value === 'wysiwyg') {
+    const view = pmView()
+    if (!view) return
+    const matches = collectMatches(view.state, findQuery())
+    findTotal.value = matches.length
+    const idx = currentMatchIndex(matches, view.state)
+    if (idx >= 0) {
+      replaceMatch(view, matches[idx], text)
+    } else {
+      // 当前不在匹配上：先定位下一个，不自动替换（避免误替换）
+      pmStep(1)
+      return
+    }
+  } else {
+    activeCm()?.replaceNextMatch()
+  }
+  adoptMarkdownFromSource()
+  refreshFindCount()
+}
+
+function onFindReplaceAll() {
+  const text = findReplace.value
+  if (mode.value === 'wysiwyg') {
+    const view = pmView()
+    if (!view) return
+    const matches = collectMatches(view.state, findQuery())
+    replaceAllInView(view, matches, text)
+  } else {
+    activeCm()?.replaceAllMatches()
+  }
+  adoptMarkdownFromSource()
+  refreshFindCount()
+}
+
+/** CM 路径替换后内容在 view 里，需同步回保存链路（wysiwyg 路径事务后同样走这里） */
+function adoptMarkdownFromSource() {
+  const text = mode.value === 'wysiwyg' ? captureCrepeMarkdown() : activeCm()?.getText()
+  if (text != null) adoptMarkdown(text)
+}
+
+function onOpenFind(replace: boolean) {
+  if (replace) findWithReplace.value = true
+  findVisible.value = true
+  void nextTick(refreshFindCount)
+}
+
+function onCloseFind() {
+  findVisible.value = false
+  activeCm()?.closeFind()
+}
+
+// ---- 大纲导航 ----
+interface OutlineItem {
+  level: number
+  text: string
+  pos?: number // wysiwyg: ProseMirror 位置
+  line?: number // source/split: 行号（1 起）
+}
+const outlineVisible = ref(false)
+const outlineItems = ref<OutlineItem[]>([])
+let outlineTimer: ReturnType<typeof setInterval> | null = null
+
+function buildWysiwygOutline(items: OutlineItem[]): void {
+  const view = pmView()
+  if (!view) return
+  view.state.doc.descendants((node, pos) => {
+    if (node.type.name === 'heading') {
+      items.push({ level: Number(node.attrs.level) || 1, text: node.textContent, pos })
+    }
+    return
+  })
+}
+
+function buildSourceOutline(items: OutlineItem[]): void {
+  const lines = localContent.value.split('\n')
+  let inFence = false
+  lines.forEach((ln, i) => {
+    if (/^\s*(```|~~~)/.test(ln)) {
+      inFence = !inFence
+      return
+    }
+    if (inFence) return
+    const m = /^(#{1,6})\s+(.*)$/.exec(ln)
+    if (m) items.push({ level: m[1].length, text: m[2].trim(), line: i + 1 })
+  })
+}
+
+/** 重建大纲；内容无变化时不触发响应式更新 */
+function rebuildOutline() {
+  const items: OutlineItem[] = []
+  if (mode.value === 'wysiwyg') buildWysiwygOutline(items)
+  else buildSourceOutline(items)
+  if (JSON.stringify(items) !== JSON.stringify(outlineItems.value)) outlineItems.value = items
+}
+
+function toggleOutline() {
+  outlineVisible.value = !outlineVisible.value
+  if (outlineVisible.value) {
+    rebuildOutline()
+    // 面板打开期间轻量轮询（600ms 字符串对比），捕捉编辑中标题变化
+    if (!outlineTimer) outlineTimer = setInterval(() => {
+      if (outlineVisible.value) rebuildOutline()
+    }, 600)
+  } else stopOutlineTimer()
+}
+
+function stopOutlineTimer() {
+  if (outlineTimer) {
+    clearInterval(outlineTimer)
+    outlineTimer = null
+  }
+}
+
+function onOutlineClick(item: OutlineItem) {
+  if (mode.value === 'wysiwyg') {
+    const view = pmView()
+    if (!view || item.pos == null) return
+    view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, item.pos)).scrollIntoView())
+    view.focus()
+  } else {
+    const cm = activeCm()
+    if (cm && item.line != null) cm.scrollToLine(item.line)
+  }
+}
+
+/** 编辑器面板级 Ctrl+F / Ctrl+H（捕获阶段，覆盖 Crepe 内容区；CM 内部同键已让位） */
+function onPanelKeydown(e: KeyboardEvent) {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return
+  const k = e.key.toLowerCase()
+  if (k === 'f') {
+    e.preventDefault()
+    e.stopPropagation()
+    onOpenFind(false)
+  } else if (k === 'h') {
+    e.preventDefault()
+    e.stopPropagation()
+    onOpenFind(true)
+  }
+}
+
+function applyMdAction(action: MdAction) {
+  if (!props.note) return
+  // 历史操作走命令通道（非文本变换）：wysiwyg 用 Crepe 内置 history，源码/分屏用 CM history
+  if (action === 'undo' || action === 'redo') {
+    if (mode.value === 'wysiwyg') {
+      if (!crepe) return
+      crepe.editor.action(callCommand(action === 'undo' ? undoCommand.key : redoCommand.key))
+      return
+    }
+    const view = activeCm()?.view
+    if (!view) return
+    void (action === 'undo' ? cmUndo(view) : cmRedo(view))
+    return
+  }
+  if (mode.value === 'wysiwyg') {
+    // Crepe 拿不到等价的源码光标位置，退化在文末操作；capture → 变换 → 重挂
+    const md = captureCrepeMarkdown()
+    if (md == null) return
+    const { text } = transformMarkdown(md, md.length, md.length, action)
+    adoptMarkdown(text)
+    void nextTick(() => {
+      if (rootEl.value && mode.value === 'wysiwyg') void mountEditor(localContent.value)
+    })
+    return
+  }
+  const cm = mode.value === 'split' ? splitSourceEl.value : sourceEl.value
+  if (!cm) return
+  const sel = cm.getSelection()
+  const { text, selStart, selEnd } = transformMarkdown(cm.getText(), sel.from, sel.to, action)
+  // 一次 dispatch 完成全文替换+选区恢复，再走 adoptMarkdown（回流时值一致自动跳过）
+  cm.setDocWithSelection(text, selStart, selEnd)
+  adoptMarkdown(text)
+  cm.focusEditor()
+}
+
+const TOOLBAR_BUTTONS: { action: MdAction; title: string; icon: Component }[] = [
+  { action: 'bold', title: '加粗', icon: Bold },
+  { action: 'italic', title: '斜体', icon: Italic },
+  { action: 'strike', title: '删除线', icon: Strikethrough },
+  { action: 'h1', title: '一级标题', icon: Heading1 },
+  { action: 'h2', title: '二级标题', icon: Heading2 },
+  { action: 'h3', title: '三级标题', icon: Heading3 },
+  { action: 'ul', title: '无序列表', icon: List },
+  { action: 'ol', title: '有序列表', icon: ListOrdered },
+  { action: 'task', title: '任务列表', icon: ListTodo },
+  { action: 'quote', title: '引用', icon: Quote },
+  { action: 'code', title: '行内代码', icon: Code },
+  { action: 'highlight', title: '高亮', icon: Highlighter },
+  { action: 'codeblock', title: '代码块', icon: SquareCode },
+  { action: 'link', title: '链接', icon: Link2 },
+  { action: 'hr', title: '分割线', icon: Minus },
+  { action: 'undo', title: '撤销 (Ctrl+Z)', icon: Undo2 },
+  { action: 'redo', title: '重做 (Ctrl+Y)', icon: Redo2 },
+]
+
 // ---- 标签 ----
 async function persistTags() {
   if (!props.note || !isTauri()) return
@@ -1002,7 +1490,7 @@ function onEditorAreaMouseDown(e: MouseEvent) {
 </script>
 
 <template>
-  <div class="card editor-panel">
+  <div class="card editor-panel" @keydown.capture="onPanelKeydown">
     <!-- 空状态 -->
     <div v-if="!note" class="editor-empty">
       <p>选择或新建笔记</p>
@@ -1043,28 +1531,55 @@ function onEditorAreaMouseDown(e: MouseEvent) {
         </button>
       </header>
 
+      <!-- 格式工具栏：三模式通用（Markdown 文本变换） -->
+      <div class="md-toolbar" role="toolbar" aria-label="格式工具栏">
+        <button
+          v-for="b in TOOLBAR_BUTTONS"
+          :key="b.action"
+          type="button"
+          class="md-tool-btn"
+          :title="b.title"
+          :aria-label="b.title"
+          @click="applyMdAction(b.action)"
+        >
+          <component :is="b.icon" :size="14" :stroke-width="2" />
+        </button>
+        <span class="md-tool-sep" aria-hidden="true"></span>
+        <button
+          type="button"
+          class="md-tool-btn"
+          :class="{ active: outlineVisible }"
+          title="大纲"
+          aria-label="大纲"
+          @click="toggleOutline"
+        >
+          <ListTree :size="14" :stroke-width="2" />
+        </button>
+      </div>
+
+      <div class="ed-body">
       <div v-if="mode === 'wysiwyg'" ref="rootEl" class="crepe-root" @mousedown.capture="onEditorAreaMouseDown"></div>
-      <textarea
+      <CodeMirrorSource
         v-else-if="mode === 'source'"
+        ref="sourceEl"
         class="md-source"
-        :value="localContent"
-        spellcheck="false"
+        :model-value="localContent"
         placeholder="开始记录…"
-        aria-label="Markdown 源码"
-        @input="onSourceInput"
-        @keydown="onSourceKeydown"
+        :transform-on-enter="expandOnEnter"
+        @update:model-value="onSourceInput"
+        @open-find="onOpenFind"
+        @close-find="onCloseFind"
       />
       <div v-else class="ed-split">
-        <textarea
+        <CodeMirrorSource
           ref="splitSourceEl"
           class="md-source"
-          :value="localContent"
-          spellcheck="false"
+          :model-value="localContent"
           placeholder="开始记录…"
-          aria-label="Markdown 源码"
-          @input="onSourceInput"
-          @keydown="onSourceKeydown"
-          @scroll="syncPreviewScroll"
+          :transform-on-enter="expandOnEnter"
+          @update:model-value="onSourceInput"
+          @open-find="onOpenFind"
+          @close-find="onCloseFind"
         />
         <div
           v-if="localContent.trim()"
@@ -1075,6 +1590,49 @@ function onEditorAreaMouseDown(e: MouseEvent) {
           @click="onPreviewClick"
         />
         <p v-else class="md-preview md-preview-empty">开始记录…</p>
+      </div>
+
+      <FindReplaceBar
+        :visible="findVisible"
+        :with-replace="findWithReplace"
+        :total="findTotal"
+        :current="findCurrent"
+        @update:search="onFindSearch"
+        @update:replace="onFindReplace"
+        @update:case="onFindCase"
+        @update:regexp="onFindRegexp"
+        @next="onFindNext"
+        @prev="onFindPrev"
+        @replace-one="onFindReplaceOne"
+        @replace-all="onFindReplaceAll"
+        @close="onCloseFind"
+      />
+
+      <Transition name="outline-panel">
+        <div v-if="outlineVisible" class="outline-panel">
+          <div class="outline-head">
+            <span>大纲</span>
+            <button type="button" class="outline-close" title="关闭" @click="outlineVisible = false">
+              <X :size="13" :stroke-width="2" />
+            </button>
+          </div>
+          <div v-if="outlineItems.length" class="outline-list">
+            <button
+              v-for="(it, i) in outlineItems"
+              :key="i"
+              type="button"
+              class="outline-item"
+              :style="{ paddingLeft: (it.level - 1) * 12 + 8 + 'px' }"
+              :title="it.text"
+              @click="onOutlineClick(it)"
+            >
+              <span class="outline-lv">H{{ it.level }}</span>
+              <span class="outline-text">{{ it.text || '（空标题）' }}</span>
+            </button>
+          </div>
+          <p v-else class="outline-empty">暂无标题，用「# 标题」或斜杠菜单创建</p>
+        </div>
+      </Transition>
       </div>
 
       <!-- 底栏：左标签行 + 右保存状态 -->
@@ -1119,10 +1677,12 @@ function onEditorAreaMouseDown(e: MouseEvent) {
           </button>
         </div>
 
+        <span class="ed-wordcount" title="正文字符数">{{ localContent.length }} 字</span>
         <span class="ed-status" :class="{ dirty }">
           {{ dirty ? '编辑中…' : `已保存 ${formatSavedTime(note.updated_at)}` }}
         </span>
       </footer>
+
     </template>
 
     <EmojiPicker :visible="emojiPickerVisible" @select="onPickEmoji" @close="emojiPickerVisible = false" />
@@ -1206,6 +1766,29 @@ function onEditorAreaMouseDown(e: MouseEvent) {
 .del:hover {
   color: var(--c-red);
   background: color-mix(in srgb, var(--c-red) 10%, transparent);
+}
+
+/* ==高亮== 扩展语法的视觉：富文本内 mark 元素（fork 自定义 schema 输出） */
+.crepe-root mark.hl-mark,
+.md-preview mark.hl-mark {
+  padding: 0 3px;
+  background: color-mix(in srgb, var(--c-yellow) 45%, transparent);
+  color: inherit;
+  border-radius: 3px;
+}
+[data-theme='dark'] .crepe-root mark.hl-mark,
+[data-theme='dark'] .md-preview mark.hl-mark {
+  background: color-mix(in srgb, var(--c-yellow) 32%, transparent);
+}
+
+/* 编辑主体包裹层：承载查找替换浮条定位，内部三模式互斥布局 */
+.ed-body {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .crepe-root {
@@ -1610,6 +2193,72 @@ html[data-wallpaper-clear='1'] .crepe-root .milkdown {
   --crepe-color-selected: rgba(255, 255, 255, 0.22);
 }
 
+/* ---- 编辑器元素级排版精修（fork）：标题层级/代码块/表格/引用/hr，全走应用令牌 ---- */
+.crepe-root .milkdown h1 {
+  font-size: 1.6em;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  margin: 0.9em 0 0.35em;
+}
+.crepe-root .milkdown h2 {
+  font-size: 1.38em;
+  font-weight: 700;
+  margin: 0.85em 0 0.3em;
+}
+.crepe-root .milkdown h3 {
+  font-size: 1.2em;
+  font-weight: 700;
+  margin: 0.8em 0 0.25em;
+}
+.crepe-root .milkdown h4,
+.crepe-root .milkdown h5,
+.crepe-root .milkdown h6 {
+  font-size: 1.05em;
+  font-weight: 700;
+  margin: 0.75em 0 0.2em;
+}
+.crepe-root .milkdown p {
+  margin: 0.35em 0;
+  line-height: 1.75;
+}
+.crepe-root .milkdown .milkdown-code-block {
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+}
+.crepe-root .milkdown .milkdown-code-block .cm-editor {
+  background: var(--input-bg);
+}
+.crepe-root .milkdown .milkdown-table-block table,
+.crepe-root .milkdown table {
+  border-collapse: collapse;
+}
+.crepe-root .milkdown th {
+  background: var(--bg-card-soft);
+  font-weight: 600;
+}
+.crepe-root .milkdown th,
+.crepe-root .milkdown td {
+  border: 1px solid var(--border-strong);
+  padding: 5px 10px;
+}
+.crepe-root .milkdown blockquote {
+  border-left: 3px solid var(--brand-500);
+  background: var(--brand-50);
+  padding: 2px 12px;
+  border-radius: 0 8px 8px 0;
+  color: var(--text-2);
+}
+.crepe-root .milkdown hr {
+  border: none;
+  height: 1px;
+  background: var(--border-strong);
+  margin: 1em 0;
+}
+[data-theme='dark'] .crepe-root .milkdown blockquote {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
 /* 编辑区内边距：Crepe 默认 padding 60px 120px 过大（文字距卡片边缘 145px），收紧为上下 20 / 左右 72。
    左右 72px 是块把手悬停空间（把手 66px 宽 + offset 4px，见 featureConfigs 的 blockHandle.getOffset），
    再小会导致把手翻转盖住文字或触发横向滚动 */
@@ -1713,5 +2362,146 @@ html[data-wallpaper-clear='1'] .crepe-root .milkdown {
 .crepe-root .milkdown .milkdown-image-block:hover .image-wrapper::after,
 .crepe-root .milkdown .milkdown-image-block .image-wrapper:active::after {
   opacity: 0.9;
+}
+
+/* 格式工具栏：三模式通用，位于标题栏与正文之间 */
+.md-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1px;
+  padding: 0 6px 6px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--border-1);
+}
+.md-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  color: var(--text-3);
+  transition: background 0.12s, color 0.12s;
+}
+.md-tool-btn:hover {
+  background: var(--bg-card-soft);
+  color: var(--text-1);
+}
+.md-tool-btn.active {
+  background: var(--brand-50);
+  color: var(--brand-500);
+}
+/* 工具栏功能分组分隔线（撤销重做与大纲之间的视觉断点） */
+.md-tool-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 4px;
+  background: var(--border-strong);
+  opacity: 0.5;
+}
+
+/* ---- 大纲导航面板（右上浮层，与查找替换条同风格） ---- */
+.outline-panel {
+  position: absolute;
+  top: 8px;
+  right: 16px;
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  width: 248px;
+  max-height: 62%;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg, 12px);
+  background: var(--bg-card-solid);
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  box-shadow: 0 8px 28px rgba(30, 30, 60, 0.16);
+  overflow: hidden;
+}
+.outline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border-soft);
+}
+.outline-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--text-3);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.outline-close:hover {
+  background: var(--c-red);
+  color: #fff;
+}
+.outline-list {
+  overflow-y: auto;
+  padding: 4px;
+}
+.outline-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.outline-item:hover {
+  background: var(--brand-50);
+  color: var(--text-1);
+}
+.outline-lv {
+  flex-shrink: 0;
+  padding: 0 3px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--text-4);
+  background: var(--bg-card-soft);
+  border-radius: 3px;
+}
+.outline-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.outline-empty {
+  padding: 14px 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.outline-panel-enter-active,
+.outline-panel-leave-active {
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+.outline-panel-enter-from,
+.outline-panel-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+.md-tool-btn:active {
+  background: var(--brand-50);
+  color: var(--brand-500);
+}
+.ed-wordcount {
+  margin-right: 10px;
+  font-size: 0.6875em;
+  color: var(--text-4);
 }
 </style>

@@ -28,6 +28,8 @@ export interface Note {
   content: string
   created_at: string
   updated_at: string
+  /** 垃圾箱：非空表示已移入垃圾箱的时刻 */
+  deleted_at?: string | null
 }
 
 export interface Todo {
@@ -862,7 +864,12 @@ export const tauriApi = {
   createNote: (title: string) => invoke<Note>('create_note', { title }),
   updateNote: (id: number, title: string, content: string) =>
     invoke<Note>('update_note', { id, title, content }),
+  getNote: (id: number) => invoke<Note>('get_note', { id }),
   deleteNote: (id: number) => invoke<void>('delete_note', { id }),
+  restoreNote: (id: number) => invoke<void>('restore_note', { id }),
+  purgeNote: (id: number) => invoke<void>('purge_note', { id }),
+  listTrash: () => invoke<Note[]>('list_trash'),
+  emptyTrash: () => invoke<number>('empty_trash'),
   listNotes: () => invoke<Note[]>('list_notes'),
   searchAll: (keyword: string) => invoke<SearchResult>('search_all', { keyword }),
   listTodos: () => invoke<Todo[]>('list_todos'),

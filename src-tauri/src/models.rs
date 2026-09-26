@@ -30,6 +30,9 @@ pub struct Note {
     pub content: String,
     pub created_at: String,
     pub updated_at: String,
+    /// 垃圾箱：非空表示已移入垃圾箱的时刻（软删除），NULL 为正常笔记
+    #[serde(default)]
+    pub deleted_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -123,7 +123,11 @@ export function restoreCrepeMarkdown(text: string): string {
     if (BR_LINE.test(line)) return ''
     const listed = line.replace(LIST_STAR, '$1- ')
     const withoutBreak = listed.replace(LIST_BR, '$1')
-    return mapInlineProse(withoutBreak, unescapeCrepeProse)
+    // 行尾硬换行痕迹（Shift+Enter 序列化出的单个 `\` 或 2+ 空格）统一为干净单换行，
+    // 与 remarkLineBreak 的解析行为对齐（其 transformer 本就吞噬换行前空白）。
+    // 只清理整行末尾，行内代码转义（如 `\`）不受影响；双反斜杠结尾是字面反斜杠，保留
+    const withoutHardBreak = withoutBreak.replace(/(?<!\\)\\$/, '').replace(/ {2,}$/, '')
+    return mapInlineProse(withoutHardBreak, unescapeCrepeProse)
   })
 }
 

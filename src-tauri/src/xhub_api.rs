@@ -1071,7 +1071,8 @@ fn data_notes_delete(
         .and_then(|v| v.as_i64())
         .ok_or_else(|| "INVALID_ARGUMENT: 缺少 id".to_string())?;
     data_write(app, state, Some("notes-changed"), |conn| {
-        repo::note::delete(conn, id).map_err(|e| e.to_string())?;
+        // 与主命令同语义：移入垃圾箱（软删除），可恢复
+        repo::note::soft_delete(conn, id).map_err(|e| e.to_string())?;
         Ok(Value::Null)
     })
 }

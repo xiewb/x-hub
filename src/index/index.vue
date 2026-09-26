@@ -533,15 +533,7 @@ async function onDeleteNote(id: number) {
   if (!target) return
   await store.removeNote(id)
   if (activeNoteId.value === id) activeNoteId.value = null
-  showToast('笔记已删除', {
-    label: '撤销',
-    onClick: async () => {
-      const n = await store.addNote(target.title)
-      await store.saveNote(n.id, target.title, target.content)
-      activeNoteId.value = n.id
-      showToast('已恢复笔记')
-    },
-  })
+  showToast('已移入垃圾箱，可在速记列表底部恢复')
 }
 
 function onSaveNote(id: number, title: string, content: string) {

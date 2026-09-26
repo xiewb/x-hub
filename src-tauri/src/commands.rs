@@ -247,12 +247,54 @@ pub fn update_note(
     Ok(note)
 }
 
+/// 移入垃圾箱（软删除，可恢复）
 #[tauri::command]
 pub fn delete_note(state: State<'_, DbState>, id: i64) -> Result<(), String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    note::delete(&conn, id).map_err(err_str)?;
-    log::info!("删除笔记: id={}", id);
+    note::soft_delete(&conn, id).map_err(err_str)?;
+    log::info!("笔记移入垃圾箱: id={}", id);
     Ok(())
+}
+
+/// 从垃圾箱恢复笔记
+#[tauri::command]
+pub fn restore_note(state: State<'_, DbState>, id: i64) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    note::restore(&conn, id).map_err(err_str)?;
+    log::info!("笔记从垃圾箱恢复: id={}", id);
+    Ok(())
+}
+
+/// 彻底删除垃圾箱中的笔记（不可恢复）
+#[tauri::command]
+pub fn purge_note(state: State<'_, DbState>, id: i64) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    note::purge(&conn, id).map_err(err_str)?;
+    log::info!("笔记彻底删除: id={}", id);
+    Ok(())
+}
+
+/// 垃圾箱列表
+#[tauri::command]
+pub fn list_trash(state: State<'_, DbState>) -> Result<Vec<Note>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    note::list_trash(&conn).map_err(err_str)
+}
+
+/// 清空垃圾箱，返回清除条数
+#[tauri::command]
+pub fn empty_trash(state: State<'_, DbState>) -> Result<usize, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let n = note::empty_trash(&conn).map_err(err_str)?;
+    log::info!("清空垃圾箱: {} 条", n);
+    Ok(n)
+}
+
+/// 单条笔记全文：恢复/外部新建等场景按 id 补拉（list_meta 不含正文）
+#[tauri::command]
+pub fn get_note(state: State<'_, DbState>, id: i64) -> Result<Note, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    note::get(&conn, id).map_err(err_str)
 }
 
 /// 笔记列表（仅元信息，不拉正文）：外部浮层保存速记后主窗口刷新列表用，

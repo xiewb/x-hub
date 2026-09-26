@@ -50,7 +50,8 @@ fn migrate(conn: &Connection) -> Result<()> {
           title TEXT NOT NULL DEFAULT '',
           content TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
-          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+          updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+          deleted_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS tags (
@@ -341,6 +342,15 @@ fn migrate(conn: &Connection) -> Result<()> {
                 [],
             )?;
         }
+    }
+
+    // 速记垃圾箱：notes 表补 deleted_at 列（软删除标记，ALTER TABLE ADD COLUMN 幂等）
+    let note_cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(notes)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    if !note_cols.iter().any(|c| c == "deleted_at") {
+        conn.execute("ALTER TABLE notes ADD COLUMN deleted_at TEXT", [])?;
     }
 
     // 倒计时表补 auto_paused 列（工作台卡片不可见时的自动冻结标记，ALTER TABLE ADD COLUMN 幂等）
