@@ -31,21 +31,28 @@ function walkText(
 
 export const forkHighlightRemark = $remark('forkHighlight', () => {
   function attacher(this: { data: (key: string, value?: unknown) => unknown }) {
-    // serialize 侧：remark-stringify 的 handler 扩展（remark-gfm 同款注入协议）
-    this.data('toMarkdownExtensions', {
-      extensions: [
-        {
-          handlers: {
-            highlight(node: any, _parent: unknown, state: any) {
-              const exit = state.enter('highlight')
-              const value = state.containerPhrasing(node, { before: '=', after: '=' })
-              exit()
-              return `==${value}==`
+    // serialize 侧：remark-stringify 的 handler 扩展（remark-gfm 同款注入协议）。
+    // ⚠ unified 的 data(key, value) 两参调用是「覆盖」语义：直接写会抹掉 remark-gfm 等已注册的
+    // toMarkdownExtensions（表格的 stringify handler 丢失 → 含表格内容 create 时抛
+    // "Cannot handle unknown node `table`"，编辑器空白）。必须先读现有数组再拼接。
+    const existing = (this.data('toMarkdownExtensions') as unknown[]) || []
+    this.data('toMarkdownExtensions', [
+      ...existing,
+      {
+        extensions: [
+          {
+            handlers: {
+              highlight(node: any, _parent: unknown, state: any) {
+                const exit = state.enter('highlight')
+                const value = state.containerPhrasing(node, { before: '=', after: '=' })
+                exit()
+                return `==${value}==`
+              },
             },
           },
-        },
-      ],
-    })
+        ],
+      },
+    ])
     // parse 侧：text 内 ==x== 拆为 highlight 节点
     return (tree: any) => {
       const find = /==([^=\n]+)==/g

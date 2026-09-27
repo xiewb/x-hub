@@ -1769,6 +1769,18 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   background: color-mix(in srgb, var(--c-red) 10%, transparent);
 }
 
+/* 单换行视觉统一（fork 修复）：remarkLineBreak 把源码内单换行解析为 inline hardbreak，
+ * milkdown 默认将其 toDOM 为含一个空格的 span（文字连排），而实时预览渲染为 <br>（真换行），
+ * 导致编辑态与预览不一致。这里把该 span 变为零高度强制断行，与预览 <br> 视觉对齐。 */
+.crepe-root .milkdown span[data-type='hardbreak'][data-is-inline='true'] {
+  display: block;
+  height: 0;
+  overflow: hidden;
+  font-size: 0;
+  line-height: 0;
+  white-space: pre;
+}
+
 /* ==高亮== 扩展语法的视觉：富文本内 mark 元素（fork 自定义 schema 输出） */
 .crepe-root mark.hl-mark,
 .md-preview mark.hl-mark {
@@ -1878,7 +1890,10 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   border-radius: var(--radius-md);
   padding: 12px 14px;
   color: var(--text-1);
-  line-height: 1.6;
+  /* 所见即所得（fork）：字号/行高与 Crepe 编辑器完全一致（15px × 笔记字号系数）。
+   容器行高 1.5 对齐 Crepe reset 默认；段落自身 1.75 由下方 p 规则显式声明 */
+  font-size: calc(15px * var(--fs-notes, 1));
+  line-height: 1.5;
 }
 
 .md-preview-empty {
@@ -1976,6 +1991,149 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   padding-left: 12px;
   border-left: 2px solid var(--border-strong);
   color: var(--text-2);
+}
+
+/* ---- 所见即所得对齐（fork）：以下元素排版完全复刻 .crepe-root .milkdown 的编辑器视觉，
+ *    两条规则需同步维护（预览 :deep() 与编辑器 Crepe 主题分别声明，参数一致） ---- */
+.md-preview :deep(p) {
+  margin: 0.35em 0;
+  line-height: 1.75;
+  /* Crepe reset 给段落内建上下 4px padding，此处复刻保证段间距一致 */
+  padding: 4px 0;
+}
+.md-preview :deep(ul),
+.md-preview :deep(ol) {
+  margin: 0.35em 0;
+  padding-left: 1.6em;
+}
+.md-preview :deep(li) {
+  margin: 0.15em 0;
+}
+/* 标题行高逐级对齐 Crepe reset 真值（多行长标题换行时行距一致） */
+.md-preview :deep(h1) {
+  font-size: 1.6em;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  margin: 0.9em 0 0.35em;
+  line-height: 1.1905;
+}
+.md-preview :deep(h2) {
+  font-size: 1.38em;
+  font-weight: 700;
+  margin: 0.85em 0 0.3em;
+  line-height: 1.2222;
+}
+.md-preview :deep(h3) {
+  font-size: 1.2em;
+  font-weight: 700;
+  margin: 0.8em 0 0.25em;
+  line-height: 1.25;
+}
+.md-preview :deep(h4) {
+  font-size: 1.05em;
+  font-weight: 700;
+  margin: 0.75em 0 0.2em;
+  line-height: 1.2857;
+}
+.md-preview :deep(h5) {
+  font-size: 1.05em;
+  font-weight: 700;
+  margin: 0.75em 0 0.2em;
+  line-height: 1.3333;
+}
+.md-preview :deep(h6) {
+  font-size: 1.05em;
+  font-weight: 700;
+  margin: 0.75em 0 0.2em;
+  line-height: 1.5556;
+}
+.md-preview :deep(blockquote) {
+  margin: 0.35em 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--brand-500);
+  border-radius: 0 8px 8px 0;
+  background: var(--brand-50);
+  color: var(--text-2);
+}
+[data-theme='dark'] .md-preview :deep(blockquote) {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.md-preview :deep(hr) {
+  border: none;
+  height: 1px;
+  background: var(--border-strong);
+  margin: 1em 0;
+}
+.md-preview :deep(th) {
+  background: var(--bg-card-soft);
+  font-weight: 600;
+}
+.md-preview :deep(th),
+.md-preview :deep(td) {
+  border: 1px solid var(--border-strong);
+  padding: 5px 10px;
+}
+/* 行内代码：对齐 Crepe 主题（--crepe-color-inline-code = 品牌色） */
+.md-preview :deep(code) {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  font-size: 0.875em;
+  color: var(--brand-500);
+  background: var(--brand-50);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.md-preview :deep(pre) code,
+.md-preview :deep(.md-code) code {
+  font-size: inherit;
+  color: var(--code-text);
+  background: transparent;
+  border-radius: 0;
+  padding: 0;
+}
+
+/* ---- 所见即所得对齐二轮（fork）：以下数值来自 CDP getComputedStyle 实测两侧差异，逐项复刻 ---- */
+/* 链接色：Crepe 的 --crepe-color-primary 映射为 --text-1，预览同步；编辑器链接带下划线，预览同步 */
+.md-preview :deep(a) {
+  color: var(--text-1);
+  text-decoration: underline;
+}
+/* 引用块外边距：编辑器实际 4px 0（Crepe reset），非 0.35em */
+.md-preview :deep(blockquote) {
+  margin: 4px 0;
+}
+/* 行内代码：inline-block + 1.4286 行高 + 0 2px 内距 + 40% 透明底，全对齐 Crepe reset */
+.md-preview :deep(code) {
+  display: inline-block;
+  line-height: 1.4286;
+  padding: 0 2px;
+  background: color-mix(in srgb, var(--brand-50) 60%, transparent);
+}
+/* 标题：Crepe reset 内建上下 2px padding，复刻保证标题间垂直节奏一致 */
+.md-preview :deep(h1),
+.md-preview :deep(h2),
+.md-preview :deep(h3),
+.md-preview :deep(h4),
+.md-preview :deep(h5),
+.md-preview :deep(h6) {
+  padding: 2px 0;
+}
+/* 分隔线：Crepe reset 上下 6px padding */
+.md-preview :deep(hr) {
+  padding: 6px 0;
+}
+/* 列表：编辑器容器 margin 0；文本缩进以 CDP 视觉实测为准（Crepe marker flex 占位 34px） */
+.md-preview :deep(ul),
+.md-preview :deep(ol) {
+  margin: 0;
+  padding-left: 34px;
+}
+.md-preview :deep(li) {
+  margin: 0;
+}
+/* 代码块正文字号/行高：对齐编辑器 0.875em / 1.5 */
+.md-preview :deep(.md-code) pre {
+  font-size: 0.875em;
+  line-height: 1.5;
 }
 
 @container (max-width: 640px) {
@@ -2166,6 +2324,13 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   --crepe-color-inverse: var(--bg-card);
   --crepe-color-on-inverse: var(--text-2);
   --crepe-color-inline-code: var(--brand-500);
+  /* 字体统一（fork）：正文/标题回归应用字体栈，代码字体与预览一致，保证编辑=预览所见即所得。
+     上游默认 --crepe-font-default: Open Sans/Arial、--crepe-font-title: Georgia serif，与预览应用字体不符 */
+  --crepe-font-default: inherit;
+  --crepe-font-title: inherit;
+  --crepe-font-code: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  /* 行内代码底色与预览 code（--brand-50）同源，暗色自动跟随令牌 */
+  --crepe-color-inline-area: var(--brand-50);
 }
 
 [data-theme='dark'] .crepe-root .milkdown {
@@ -2173,7 +2338,6 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   --crepe-color-on-secondary: #d6d6d6;
   --crepe-color-hover: #232323;
   --crepe-color-selected: #2f2f2f;
-  --crepe-color-inline-area: #2b2b2b;
 }
 
 /* 透底态（壁纸+透明，白墨形态）：工具栏/斜杠菜单/链接气泡/图片说明换深玻璃实底。

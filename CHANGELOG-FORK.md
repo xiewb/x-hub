@@ -36,10 +36,22 @@
 | 4 | 2026-09-26 | `8e195b9` | v0.6.6 | 待提交 | 编辑器全面升级：源码 CodeMirror 6、查找替换、撤销重做、大纲导航、==高亮== 扩展、排版精修；含垃圾箱恢复与换行修复 |
 | 5 | 2026-09-26 | `8e195b9`→`6167b8f` | v0.7.0 | 待提交 | 上游合并 9 提交（v0.6.7+v0.7.0），零冲突自动合并；93 文件 +5242/-732 |
 | 6 | 2026-09-27 | `6167b8f`→`a03055c` | v0.7.1 | 待提交 | 上游合并 5 提交（剪贴板图片转码/发布弹窗修复/打包修复/浏览器 capability 修复），零冲突；20 文件 +433/-162 |
+| 7 | 2026-09-28 | `a03055c` | v0.7.1 | 待提交 | 所见即所得三层修复（换行/排版/字体）+ 表格挂载崩溃根因修复（forkHighlight toMarkdownExtensions 覆盖 bug）；CDP 双侧采样验证 |
 
 ---
 
 ## 三、变更详情
+
+### #7（2026-09-28）所见即所得修复 + 表格挂载崩溃根因修复
+
+**背景**：速记“实时预览”模式（Crepe 编辑器）与分屏预览（markdown-it 渲染）存在三层不一致，且含表格的内容会导致 Crepe 初始化失败、编辑器空白。
+
+- **表格挂载崩溃（根因修复）**：`src/utils/forkHighlight.ts` 的 remark attacher 中 `this.data('toMarkdownExtensions', {...})` 是 unified 的**覆盖语义**，会覆盖 remark-gfm 已注册的表格 stringify handler，导致含表格内容序列化时报 `Cannot handle unknown node \`table\``。改为先读 `this.data('toMarkdownExtensions')` 再 `concat` 新 handler（与 remark-gfm 官方协议一致）。
+- **字体统一**：`NoteEditor.vue` 在 `.crepe-root .milkdown` 覆盖 Crepe 字体变量（`--crepe-font-default/title: inherit` 回归应用字体栈，`--crepe-font-code` 保持 mono 栈，`--crepe-color-inline-area: var(--brand-50)`）。
+- **排版对齐**：以 Crepe reset 实测值为真值，在预览侧复刻：容器行高 1.5、p padding 4px 0、h1-h6 逐级行高 + padding 2px 0、hr padding 6px 0、blockquote margin 4px 0、行内 code（inline-block/1.4286/0 2px/40% 透明底）、列表 margin 0、链接色 --text-1 + 下划线、代码块 0.875em/1.5、列表文本缩进 34px（视觉实测对齐 Crepe flex marker 占位）。
+- **验证方法**：WebView2 CDP（`--remote-debugging-port=9222`）+ getComputedStyle 对 `.crepe-root .ProseMirror` 与 `.md-preview` 双侧 18 类元素×16 属性采样对比；差异从 13 类收敛至 5 类，剩余均为结构级已知限制（li display flex/list-item、pre 代码块容器结构、ul/ol padding 为 marker 实现差异的补偿值，视觉已对齐）。
+- **新增调试脚本**（`scripts/`）：`cdp-eval.py`（CDP 执行 JS）、`cdp-style-diff.py`（双侧样式采样）、`cdp-bisect-live.py`（真实应用内片段二分）、`cdp-table-debug.py`、`cdp-console.py`、`test-crepe-feature-bisect.mjs`（Crepe feature 级二分，定位根因的决定性实验）等。
+- **涉及文件**：`src/utils/forkHighlight.ts`、`src/components/NoteEditor.vue`、`scripts/cdp-*.py`、`scripts/test-*.mjs`
 
 ### #6（2026-09-27）合并上游 v0.7.1
 
