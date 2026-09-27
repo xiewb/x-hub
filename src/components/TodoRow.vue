@@ -17,7 +17,7 @@ import {
 } from 'lucide-vue-next'
 import { useStore } from '../stores/workbench'
 import type { Todo } from '../api/tauri'
-import { dueBadge, fmtHM, repeatEndLabel, repeatLabel } from '../utils/todoSchedule'
+import { dueBadge, doneAtLabel, fmtHM, repeatEndLabel, repeatLabel } from '../utils/todoSchedule'
 import ConfirmDialog from './ConfirmDialog.vue'
 
 /**
@@ -80,6 +80,8 @@ function toggleCollapse() {
 }
 
 const badge = computed(() => (props.todo.done ? null : dueBadge(props.todo, new Date())))
+/** 已完成行的完成时间徽标（勾选时后端写入 completed_at；null = 旧数据缺失，行内不显示） */
+const doneAt = computed(() => (props.todo.done ? doneAtLabel(props.todo.completed_at, new Date()) : null))
 /** 周期待办：规则文案 + 结束条件（空串 = 一次性待办） */
 const repeatText = computed(() => (props.todo.repeat_mode === 'once' ? '' : repeatLabel(props.todo)))
 const repeatTitle = computed(() => {
@@ -604,6 +606,16 @@ function hideTip() {
         >
           <Trash2 :size="12" :stroke-width="2" />
         </button>
+
+        <!-- 已完成行：完成时间徽标挂在行尾（margin-left:auto 靠右，hover 按钮在它左侧出现不挤动它） -->
+        <span
+          v-if="doneAt"
+          class="todo-done-at"
+          :title="`完成于 ${doneAt.full}`"
+        >
+          <Check :size="10" :stroke-width="2.4" />
+          {{ doneAt.text }}
+        </span>
       </div>
 
       <!-- 折叠时隐藏子待办列表；addingSub 打开时输入行必须可见（toggleSubAdd 已先展开，此处兜底） -->
@@ -815,6 +827,24 @@ function hideTip() {
   align-items: center;
   flex-shrink: 0;
   color: var(--text-4);
+  cursor: default;
+}
+
+/* 已完成行的完成时间徽标：与日期徽标同语言的弱化灰 pill，靠右对齐；
+   margin-left:auto 把它推到行尾，hover 操作按钮在它左侧出现，不会挤动它 */
+.todo-done-at {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-card-soft);
+  color: var(--text-3);
+  font-size: 0.625em;
+  font-weight: 600;
+  line-height: 14px;
   cursor: default;
 }
 

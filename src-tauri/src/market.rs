@@ -562,7 +562,15 @@ fn add_dir_to_zip<W: Write + std::io::Seek>(
                 .map_err(|e| e.to_string())?;
             add_dir_to_zip(zip, root, &path, options)?;
         } else {
-            zip.start_file(rel, options).map_err(|e| e.to_string())?;
+            // 无扩展名的 LICENSE（如包根的 `LICENSE`）在包内改名加 `.txt`：服务端发布关卡按
+            // 扩展名白名单校验包内文件，无扩展名一律拒绝；改名而非删除——MIT 等协议要求
+            // 分发时保留版权与许可声明，只改 zip 内条目名，不动开发者源码目录。
+            let entry = if !name.contains('.') && name.eq_ignore_ascii_case("license") {
+                format!("{rel}.txt")
+            } else {
+                rel
+            };
+            zip.start_file(entry, options).map_err(|e| e.to_string())?;
             let data = std::fs::read(&path).map_err(|e| e.to_string())?;
             zip.write_all(&data).map_err(|e| e.to_string())?;
         }
@@ -874,6 +882,39 @@ mod tests {
         std::fs::write(ext.join("demo.zip"), "x").unwrap();
         std::fs::write(ext.join("debug.log"), "x").unwrap();
         assert!(pack_dir_to_archive(&ext, &out).is_ok(), "data/ 资产与 .zip/.log 应可打包");
+    }
+
+    #[test]
+    fn pack_archive_renames_extensionless_license_to_txt() {
+        // 服务端发布关卡按扩展名白名单拒绝无扩展名文件：包内 `LICENSE` 必须自动改成
+        // `LICENSE.txt`（源码目录不动），带扩展名的许可文件（LICENSE.md）不受影响。
+        let tmp = tempfile::tempdir().unwrap();
+        let ext = tmp.path().join("ext");
+        std::fs::create_dir_all(ext.join("docs")).unwrap();
+        std::fs::write(
+            ext.join("manifest.json"),
+            r#"{"id":"com.x-hub.lic","name":"L","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(ext.join("LICENSE"), "MIT License").unwrap();
+        std::fs::write(ext.join("docs").join("LICENSE"), "nested MIT").unwrap();
+        std::fs::write(ext.join("LICENSE.md"), "# License").unwrap();
+
+        let out = tmp.path().join("out.xhpack");
+        pack_dir_to_archive(&ext, &out).unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..archive.len() {
+            names.push(archive.by_index(i).unwrap().name().to_string());
+        }
+        assert!(names.iter().any(|n| n == "LICENSE.txt"), "{names:?}");
+        assert!(names.iter().any(|n| n == "docs/LICENSE.txt"), "{names:?}");
+        assert!(names.iter().any(|n| n == "LICENSE.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.split('/').last().map_or(false, |f| !f.contains('.') && f.eq_ignore_ascii_case("license"))),
+            "包内不得残留无扩展名的 LICENSE：{names:?}"
+        );
     }
 
     #[test]

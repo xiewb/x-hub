@@ -438,6 +438,11 @@ function initDialog() {
   newVersion.value = suggestNextVersion(currentVersion.value)
   precheck.value = null
   showDraftDetail.value = false
+  // 截图属于上一个扩展的会话状态：不清空会带到下一个扩展的弹窗里，
+  // 且此时提交会把 A 扩展挑的截图挂到 B 扩展名下（组件常驻挂载、只靠 v-if 隐藏）
+  screenshots.value = []
+  shotPreviews.value = {}
+  detailId.value = null
   submissions.value = []
   visibleCount.value = PAGE_SIZE
   allLoaded.value = false

@@ -49,6 +49,34 @@ export function fmtHM(ts: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/**
+ * 已完成行的「完成时间」徽标文案。
+ * completed_at 是 SQLite strftime 存的 UTC 字符串（无时区后缀，如 2026-09-27 05:34:01.229），
+ * new Date 直读会按本地时区错读，必须补 Z 解析。
+ * 相对口径：今天/昨天 带时刻；同年 M月D日 带时刻；跨年补年份。解析失败返回 null（行内隐藏）。
+ */
+export function doneAtLabel(
+  completedAt: string | null,
+  now: Date,
+): { text: string; full: string } | null {
+  if (!completedAt) return null
+  const d = new Date(completedAt.includes('T') ? completedAt : `${completedAt.replace(' ', 'T')}Z`)
+  if (Number.isNaN(d.getTime())) return null
+  const day = startOfDay(d)
+  const today0 = startOfDay(now)
+  const diff = Math.round((today0.getTime() - day.getTime()) / 86_400_000)
+  const hm = ` ${fmtHM(d.getTime())}`
+  const text =
+    diff === 0
+      ? `今天${hm}`
+      : diff === 1
+        ? `昨天${hm}`
+        : d.getFullYear() === now.getFullYear()
+          ? `${fmtDay(d)}${hm}`
+          : `${d.getFullYear()}年${fmtDay(d)}${hm}`
+  return { text, full: `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日${hm}` }
+}
+
 export function groupOf(t: { due_at: number | null }, today: Date): number {
   if (t.due_at == null) return 3
   const d = startOfDay(new Date(t.due_at))

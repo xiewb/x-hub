@@ -838,7 +838,11 @@ export function useStore() {
 
   async function focusDetachedSticky(slot: number) {
     if (!isTauri()) return false
-    return tauriApi.focusDetachedSticky(slot)
+    const ok = await tauriApi.focusDetachedSticky(slot)
+    // 聚焦失败 = 后端已无该浮窗（空内容关闭浮窗时记录即被删除）：
+    // 清掉本地幻影记录，让便签卡的「脱离」按钮从「已脱离」恢复为可脱离
+    if (!ok) state.detached = state.detached.filter((x) => x.slot !== slot)
+    return ok
   }
 
   /** 浮窗输入保存（600ms 防抖由浮窗组件处理） */

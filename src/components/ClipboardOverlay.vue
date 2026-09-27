@@ -270,7 +270,8 @@ async function onSaveImage(item: ClipboardItem) {
   if (!isTauri()) return
   const src = item.image_path
   if (!src) return
-  const name = src.split(/[\\/]/).pop() ?? 'image.png'
+  // 快照可能是 .bmp（截图类应用只往剪贴板写 DIB 位图），默认名统一给 .png，由后端按扩展名转码
+  const name = (src.split(/[\\/]/).pop() ?? 'image.png').replace(/\.bmp$/i, '.png')
   try {
     const dest = await save({
       defaultPath: name,

@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.7.0"
+version = "0.7.1"
 description = "本地个人效率工作台"
 authors = ["you"]
 license = ""
@@ -48,6 +48,8 @@ ed25519-dalek = "2"
 base64 = "0.22"
 semver = "1"
 sysinfo = "0.32"
+# 剪贴板 BMP 快照导出转 PNG：只开 bmp/png 两个编解码，避免拖入全家桶
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

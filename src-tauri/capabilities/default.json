@@ -12,7 +12,9 @@
     "todo-float",
     "floating-ball",
     "chat",
-    "notice",
+    "notice"
+  ],
+  "webviews": [
     "suda-web-*-chrome"
   ],
   "permissions": [

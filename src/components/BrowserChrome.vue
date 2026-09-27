@@ -9,6 +9,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { ArrowLeft, ArrowRight, ExternalLink, RotateCw, X } from 'lucide-vue-next'
 import { isTauri, tauriApi } from '../api/tauri'
+import { reportClientError } from '../utils/error-report'
 import { useTheme } from '../composables/useTheme'
 
 // 池窗口是正常窗口：进任务栏、可 Alt+Tab 唤回（区别于应用内其他浮窗）
@@ -70,35 +71,41 @@ onMounted(async () => {
     /* 窗口槽位未就绪：保持空态 */
   }
   reportHeight()
-  unlisteners.push(
-    await listen<{ slot: number; tabs: string[]; active: number }>('suda-browser-tabs', (e) => {
-      if (e.payload.slot !== slot) return
-      tabs.value = e.payload.tabs
-      active.value = e.payload.active
-      if (!editingUrl.value) urlInput.value = e.payload.tabs[e.payload.active] ?? ''
-    }),
-  )
-  unlisteners.push(
-    await listen<{ slot: number; url: string }>('suda-browser-nav', (e) => {
-      if (e.payload.slot !== slot) return
-      if (!e.payload.url || e.payload.url === 'about:blank') return
-      if (!editingUrl.value) urlInput.value = e.payload.url
-    }),
-  )
-  unlisteners.push(
-    await listen<{ slot: number; title: string }>('suda-browser-title', (e) => {
-      if (e.payload.slot !== slot) return
-      const u = urlInput.value || currentUrl.value
-      if (u && e.payload.title) titles.value = { ...titles.value, [u]: e.payload.title }
-    }),
-  )
-  unlisteners.push(
-    await listen<{ slot: number; url: string }>('suda-browser-newwindow', (e) => {
-      // 宿主接管 target=_blank（ADR 0011：不能指望页面自己弹窗）→ 落成本窗口新 tab
-      if (e.payload.slot !== slot || !e.payload.url) return
-      void tauriApi.sudaBrowserOpenTab(slot, e.payload.url).catch(() => {})
-    }),
-  )
+  // 四个监听是一个整体：任一注册失败（如 capability 缺失导致 ACL 拒绝）页面就收不到
+  // 任何同步事件、永远停在空态——必须上报，不能静默吞掉
+  try {
+    unlisteners.push(
+      await listen<{ slot: number; tabs: string[]; active: number }>('suda-browser-tabs', (e) => {
+        if (e.payload.slot !== slot) return
+        tabs.value = e.payload.tabs
+        active.value = e.payload.active
+        if (!editingUrl.value) urlInput.value = e.payload.tabs[e.payload.active] ?? ''
+      }),
+    )
+    unlisteners.push(
+      await listen<{ slot: number; url: string }>('suda-browser-nav', (e) => {
+        if (e.payload.slot !== slot) return
+        if (!e.payload.url || e.payload.url === 'about:blank') return
+        if (!editingUrl.value) urlInput.value = e.payload.url
+      }),
+    )
+    unlisteners.push(
+      await listen<{ slot: number; title: string }>('suda-browser-title', (e) => {
+        if (e.payload.slot !== slot) return
+        const u = urlInput.value || currentUrl.value
+        if (u && e.payload.title) titles.value = { ...titles.value, [u]: e.payload.title }
+      }),
+    )
+    unlisteners.push(
+      await listen<{ slot: number; url: string }>('suda-browser-newwindow', (e) => {
+        // 宿主接管 target=_blank（ADR 0011：不能指望页面自己弹窗）→ 落成本窗口新 tab
+        if (e.payload.slot !== slot || !e.payload.url) return
+        void tauriApi.sudaBrowserOpenTab(slot, e.payload.url).catch(() => {})
+      }),
+    )
+  } catch (e) {
+    void reportClientError('浏览器顶栏事件监听注册失败（tab/地址栏将无法同步）', e)
+  }
 })
 
 onBeforeUnmount(() => {

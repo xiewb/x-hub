@@ -800,12 +800,23 @@ pub async fn detach_sticky(
     if !(1..=2).contains(&slot) {
         return Err("便签槽位取值 1-2".into());
     }
-    // 已存在浮窗：聚焦并直接返回
+    // 已存在浮窗记录：窗口在 → 聚焦；窗口不在（上次创建失败/被异常销毁）→ 原位重建，
+    // 否则记录永远在而窗口永远不在，用户再点「脱离」只会走本分支静默聚焦，卡死到重启
     if let Some(existing) = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         detached_sticky::get_by_slot(&conn, slot).map_err(err_str)?
     } {
-        crate::sticky_window::focus(&app, slot);
+        if !crate::sticky_window::focus(&app, slot) {
+            log::warn!("便签浮窗记录存在但窗口缺失，重建自愈: slot={}", slot);
+            crate::sticky_window::create_or_focus(
+                &app,
+                slot,
+                existing.x,
+                existing.y,
+                existing.always_on_top,
+            )
+            .map_err(|e| format!("创建浮窗失败: {}", e))?;
+        }
         return Ok(existing);
     }
 
@@ -818,21 +829,47 @@ pub async fn detach_sticky(
     sticky::upsert(&conn, slot, "").map_err(err_str)?;
     drop(conn);
 
-    let win = crate::sticky_window::create_or_focus(&app, slot, saved.x, saved.y, true)
-        .map_err(|e| format!("创建浮窗失败: {}", e))?;
+    // 创建失败必须回滚（删除浮窗记录 + 恢复原卡内容并广播刷新）：
+    // DB 已写而窗口没建出来，就是「内容从主卡消失 + 再也浮不起来」的根源
+    if let Err(e) = crate::sticky_window::create_or_focus(&app, slot, saved.x, saved.y, true) {
+        log::error!("便签浮窗创建失败，回滚脱离: slot={} err={}", slot, e);
+        let conn = state.0.lock().map_err(|err| err.to_string())?;
+        let _ = detached_sticky::delete_by_slot(&conn, slot);
+        let _ = sticky::upsert(&conn, slot, &content);
+        drop(conn);
+        let _ = app.emit("stickies-changed", ());
+        return Err(format!("创建浮窗失败: {}", e));
+    }
     log::info!("便签脱离浮窗: slot={} 内容 {} 字", slot, content.chars().count());
-    drop(win);
 
     Ok(saved)
 }
 
-/// 再次点击脱离 icon 时聚焦已有浮窗（无浮窗则返回 false）
+/// 再次点击脱离 icon 时聚焦已有浮窗；窗口缺失但记录在 → 原位重建自愈；
+/// 记录也不在 → 返回 false（前端据此走脱离分支）
 #[tauri::command]
-pub async fn focus_detached_sticky(app: tauri::AppHandle, slot: i64) -> Result<bool, String> {
+pub async fn focus_detached_sticky(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    slot: i64,
+) -> Result<bool, String> {
     if !(1..=2).contains(&slot) {
         return Err("便签槽位取值 1-2".into());
     }
-    Ok(crate::sticky_window::focus(&app, slot))
+    if crate::sticky_window::focus(&app, slot) {
+        return Ok(true);
+    }
+    let existing = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        detached_sticky::get_by_slot(&conn, slot).map_err(err_str)?
+    };
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    log::warn!("便签浮窗窗口缺失，重建自愈: slot={}", slot);
+    crate::sticky_window::create_or_focus(&app, slot, existing.x, existing.y, existing.always_on_top)
+        .map_err(|e| format!("创建浮窗失败: {}", e))?;
+    Ok(true)
 }
 
 /// 浮窗内容随输入保存（防抖由前端处理）
@@ -917,7 +954,9 @@ pub async fn restore_detached_sticky(
     Ok(target_slot)
 }
 
-/// 删除浮窗便签（浮窗数据彻底删除）
+/// 删除浮窗便签（浮窗数据彻底删除）。
+/// 空内容关闭浮窗也走这里：必须广播 stickies-changed，否则主窗口 state.detached
+/// 留下幻影记录，便签卡的「脱离」按钮停在「已脱离」，再点只走聚焦分支永远浮不起来
 #[tauri::command]
 pub async fn delete_detached_sticky(
     app: tauri::AppHandle,
@@ -933,6 +972,7 @@ pub async fn delete_detached_sticky(
 
     crate::sticky_window::destroy(&app, slot);
     log::info!("删除浮窗便签: slot={}", slot);
+    let _ = app.emit("stickies-changed", ());
     Ok(())
 }
 
@@ -3101,7 +3141,9 @@ pub fn set_clipboard_media_enabled(image: bool, file: bool) -> Result<(), String
     Ok(())
 }
 
-/// 导出图片快照到用户指定路径（复制快照文件，不移动）
+/// 导出图片快照到用户指定路径（不移动原文件）。
+/// 截图类应用往剪贴板写的是 CF_DIB 位图、快照落盘为 .bmp，导出为 .png 时在此
+/// 转码（`clipboard::transcode_image_bytes`），格式一致则原样写入。
 #[tauri::command]
 pub fn clipboard_export_image(
     state: State<'_, DbState>,
@@ -3111,7 +3153,13 @@ pub fn clipboard_export_image(
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     let item = clipboard::get(&conn, id).map_err(err_str)?;
     let src = item.image_path.as_deref().ok_or("图片快照缺失")?;
-    std::fs::copy(src, &dest).map_err(|e| format!("保存图片失败: {}", e))?;
+    let bytes = std::fs::read(src).map_err(|e| format!("读取图片快照失败: {}", e))?;
+    let ext = std::path::Path::new(&dest)
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let data = crate::clipboard::transcode_image_bytes(&bytes, &ext)?;
+    std::fs::write(&dest, data).map_err(|e| format!("保存图片失败: {}", e))?;
     Ok(())
 }
 
