@@ -35,10 +35,22 @@
 | 3 | 2026-09-24 | `8e195b9` | v0.6.6 | 待提交 | 速记四大增强：搜索/排序/垃圾箱/格式工具栏（开发副本 d:\source\x-hub） |
 | 4 | 2026-09-26 | `8e195b9` | v0.6.6 | 待提交 | 编辑器全面升级：源码 CodeMirror 6、查找替换、撤销重做、大纲导航、==高亮== 扩展、排版精修；含垃圾箱恢复与换行修复 |
 | 5 | 2026-09-26 | `8e195b9`→`6167b8f` | v0.7.0 | 待提交 | 上游合并 9 提交（v0.6.7+v0.7.0），零冲突自动合并；93 文件 +5242/-732 |
+| 6 | 2026-09-27 | `6167b8f`→`a03055c` | v0.7.1 | 待提交 | 上游合并 5 提交（剪贴板图片转码/发布弹窗修复/打包修复/浏览器 capability 修复），零冲突；20 文件 +433/-162 |
 
 ---
 
 ## 三、变更详情
+
+### #6（2026-09-27）合并上游 v0.7.1
+
+- **上游基点**：`6167b8f` → `a03055c`（5 个提交，4 实质 + release）
+- **上游变更**：
+  - `feat(clipboard)` 「保存图片」按目标扩展名转码，BMP 快照导出 PNG 不再全透明（`clipboard.rs` + `ClipboardOverlay.vue`）
+  - `fix(publish)` 发布弹窗复用时清空上一扩展的截图会话状态（`ExtensionPublishDialog.vue`）
+  - `fix(market)` 打包把包内无扩展名 LICENSE 改名加 `.txt`（`market.rs`）
+  - `fix(suda)` 独立浏览器顶栏永远显示空态——capability 缺 `webviews` 字段（`capabilities/default.json` + `BrowserChrome.vue`，`SudaFormDialog.vue` 大幅简化 -76 行）
+  - `TodoRow.vue`/`todoSchedule.ts` 待办调度增强，`focusDetachedSticky` 幻影浮窗清理（`workbench.ts`，与 fork 的 refreshNotes 改动不同区域，无冲突）
+- **合并结果**：零冲突自动合并；`vue-tsc` + `cargo check` 双侧验证通过
 
 ### #5（2026-09-26）合并上游 v0.7.0
 
