@@ -235,6 +235,24 @@ pub fn launch_resource(state: State<'_, DbState>, id: i64) -> Result<(), String>
     }
 }
 
+/// 以管理员身份启动速达「程序」资源（触发 UAC 确认）。仅 App 类型支持——
+/// 网页/文件没有「提权运行」的语义。不走 launch_program 的 740 自动提权路径：
+/// 这里是用户显式要求提权，直接 Start-Process -Verb RunAs。
+#[tauri::command]
+pub fn launch_resource_as_admin(state: State<'_, DbState>, id: i64) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let res = resource::get(&conn, id).map_err(err_str)?;
+    match res.kind {
+        ResourceKind::App => {
+            process::launch_elevated(&res.target, res.args.as_deref())?;
+            let _ = resource::touch(&conn, id);
+            log::info!("以管理员身份启动程序: {} ({})", res.name, res.target);
+            Ok(())
+        }
+        _ => Err("只有「程序」类型的资源支持以管理员身份运行".into()),
+    }
+}
+
 // ---------- 速达小类（ADR 0012）----------
 
 fn validate_subcategory_input(kind: &str, name: &str) -> Result<(), String> {
@@ -516,6 +534,29 @@ pub fn reorder_todo_orders(
     let _ = app.emit("todos-changed", ());
     log::debug!("待办排序更新: {} 条", ids.len());
     Ok(())
+}
+
+/// 跨父拖拽：把子待办改挂到另一个顶级父待办下，并按传入顺序重写目标父下的子项排序。
+/// `ordered_ids` 为目标落点后的完整子项顺序（含被移动项）。
+#[tauri::command]
+pub fn move_todo_child(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    id: i64,
+    new_parent_id: i64,
+    ordered_ids: Vec<i64>,
+) -> Result<Todo, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let t = todo::move_child(&conn, id, new_parent_id, &ordered_ids)?;
+    drop(conn);
+    let _ = app.emit("todos-changed", ());
+    log::info!(
+        "子待办改挂父级: id={} -> parent={} (目标下 {} 条)",
+        id,
+        new_parent_id,
+        ordered_ids.len()
+    );
+    Ok(t)
 }
 
 // ---------- 待办升级：描述 / 置顶 / 周期 / 标签 ----------
@@ -1351,21 +1392,14 @@ pub struct NoteTagRow {
 pub struct AppInfo {
     /// 当前应用版本号（运行时读取打包版本，与 tauri.conf.json 一致）
     pub version: String,
-    /// 完整版本历史 markdown（内置，零网络）
-    pub changelog: String,
-    /// 最新一段版本说明（「What's New」弹窗用）
-    pub latest_section: String,
 }
 
-/// 返回应用版本 + 内置更新日志（版本历史），供「关于」页展示
+/// 返回应用版本号，供「关于」页与扩展市场的最低版本判断使用。
+/// 版本历史不再内置：客户端「关于」页直接跳转 GitHub Releases。
 #[tauri::command]
 pub fn get_app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
     let version = app.package_info().version.to_string();
-    Ok(AppInfo {
-        version,
-        changelog: crate::about::RELEASE_NOTES.to_string(),
-        latest_section: crate::about::latest_section(),
-    })
+    Ok(AppInfo { version })
 }
 
 // ---------- 配置 ----------
@@ -1441,6 +1475,44 @@ pub fn get_global_shortcut() -> Result<String, String> {
 
 #[tauri::command]
 pub fn set_global_shortcut(app: tauri::AppHandle, value: String) -> Result<String, String> {
+    set_configured_shortcut(app, value, ConfiguredShortcut::Main)
+}
+
+/// 可自定义快捷键在配置里的落点（set_*_shortcut 命令共用同一套改绑/持久化流程）
+enum ConfiguredShortcut {
+    Main,
+    Clipboard,
+    Search,
+    Chat,
+}
+
+impl ConfiguredShortcut {
+    fn field<'a>(&self, cfg: &'a mut crate::config::AppConfig) -> &'a mut String {
+        match self {
+            ConfiguredShortcut::Main => &mut cfg.global_shortcut,
+            ConfiguredShortcut::Clipboard => &mut cfg.clipboard_shortcut,
+            ConfiguredShortcut::Search => &mut cfg.search_shortcut,
+            ConfiguredShortcut::Chat => &mut cfg.chat_shortcut,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            ConfiguredShortcut::Main => "主窗口",
+            ConfiguredShortcut::Clipboard => "剪贴板",
+            ConfiguredShortcut::Search => "搜索",
+            ConfiguredShortcut::Chat => "AI 对话",
+        }
+    }
+}
+
+/// 更新某个可自定义全局快捷键：改绑（冲突预检/反注册/注册/回滚）+ 配置持久化。
+/// 同一物理按键组合仅换写法（CommandOrControl→Ctrl）时直接改存储字符串，不重新注册。
+fn set_configured_shortcut(
+    app: tauri::AppHandle,
+    value: String,
+    which: ConfiguredShortcut,
+) -> Result<String, String> {
     let _guard = crate::config::lock();
     let shortcut = value.trim();
     if shortcut.is_empty() {
@@ -1448,40 +1520,41 @@ pub fn set_global_shortcut(app: tauri::AppHandle, value: String) -> Result<Strin
     }
 
     let mut config = crate::config::load();
-    let previous = config.global_shortcut.clone();
+    let previous = config_field(&config, &which);
     if previous == shortcut {
-        return Ok(config.global_shortcut);
+        return Ok(previous);
     }
-
-    // 同一物理按键组合仅换了写法（如 Windows 上 CommandOrControl→Ctrl），
-    // 无需重新注册，直接更新存储的字符串
     if crate::shortcut::same_hotkey(&previous, shortcut) {
-        config.global_shortcut = shortcut.to_string();
+        *which.field(&mut config) = shortcut.to_string();
         crate::config::save(&config)?;
-        return Ok(config.global_shortcut);
+        return Ok(shortcut.to_string());
     }
-
-    if crate::shortcut::is_shortcut_registered(&app, shortcut) {
-        return Err("快捷键冲突".into());
-    }
-
-    if let Err(e) = crate::shortcut::unregister_toggle_shortcut(&app, &previous) {
-        if !crate::shortcut::is_conflict_error(&e) {
-            return Err(e);
-        }
-        return Err("快捷键冲突".into());
-    }
-
-    if let Err(e) = crate::shortcut::register_toggle_shortcut(&app, shortcut) {
-        let mapped = crate::shortcut::format_shortcut_error(&e);
-        if !mapped.eq(&e) {
-            let _ = crate::shortcut::register_toggle_shortcut(&app, &previous);
-        }
-        return Err(mapped);
-    }
-    config.global_shortcut = shortcut.to_string();
+    crate::shortcut::rebind_shortcut(&app, &previous, shortcut)?;
+    *which.field(&mut config) = shortcut.to_string();
     crate::config::save(&config)?;
-    Ok(config.global_shortcut)
+    log::info!("[快捷键] {}快捷键已改为 {}", which.label(), shortcut);
+    Ok(shortcut.to_string())
+}
+
+fn config_field(cfg: &crate::config::AppConfig, which: &ConfiguredShortcut) -> String {
+    match which {
+        ConfiguredShortcut::Main => cfg.global_shortcut.clone(),
+        ConfiguredShortcut::Clipboard => cfg.clipboard_shortcut.clone(),
+        ConfiguredShortcut::Search => cfg.search_shortcut.clone(),
+        ConfiguredShortcut::Chat => cfg.chat_shortcut.clone(),
+    }
+}
+
+/// 更新全局搜索呼出快捷键
+#[tauri::command]
+pub fn set_search_shortcut(app: tauri::AppHandle, value: String) -> Result<String, String> {
+    set_configured_shortcut(app, value, ConfiguredShortcut::Search)
+}
+
+/// 更新 AI 对话呼出快捷键
+#[tauri::command]
+pub fn set_chat_shortcut(app: tauri::AppHandle, value: String) -> Result<String, String> {
+    set_configured_shortcut(app, value, ConfiguredShortcut::Chat)
 }
 
 // ---------- 开机自启动 ----------
@@ -3180,41 +3253,7 @@ pub fn clipboard_get_info(state: State<'_, DbState>) -> Result<ClipboardInfo, St
 /// 更新剪贴板全局快捷键（注册/反注册与配置持久化）
 #[tauri::command]
 pub fn set_clipboard_shortcut(app: tauri::AppHandle, value: String) -> Result<String, String> {
-    let _guard = crate::config::lock();
-    let shortcut = value.trim();
-    if shortcut.is_empty() {
-        return Err("快捷键不能为空".into());
-    }
-
-    let mut config = crate::config::load();
-    let previous = config.clipboard_shortcut.clone();
-    if previous == shortcut {
-        return Ok(config.clipboard_shortcut);
-    }
-    if crate::shortcut::same_hotkey(&previous, shortcut) {
-        config.clipboard_shortcut = shortcut.to_string();
-        crate::config::save(&config)?;
-        return Ok(config.clipboard_shortcut);
-    }
-    if crate::shortcut::is_shortcut_registered(&app, shortcut) {
-        return Err("快捷键冲突".into());
-    }
-    if let Err(e) = crate::shortcut::unregister_toggle_shortcut(&app, &previous) {
-        if !crate::shortcut::is_conflict_error(&e) {
-            return Err(e);
-        }
-        return Err("快捷键冲突".into());
-    }
-    if let Err(e) = crate::shortcut::register_toggle_shortcut(&app, shortcut) {
-        let mapped = crate::shortcut::format_shortcut_error(&e);
-        if !mapped.eq(&e) {
-            let _ = crate::shortcut::register_toggle_shortcut(&app, &previous);
-        }
-        return Err(mapped);
-    }
-    config.clipboard_shortcut = shortcut.to_string();
-    crate::config::save(&config)?;
-    Ok(config.clipboard_shortcut)
+    set_configured_shortcut(app, value, ConfiguredShortcut::Clipboard)
 }
 
 /// 更新剪贴板保留策略（条数上限 / 保留天数），保存后立即执行一次清理
