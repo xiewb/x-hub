@@ -2127,6 +2127,18 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   margin: 0;
   padding-left: 34px;
 }
+/* 上游全局 reset（Tailwind preflight 风格的 ol,ul,menu{list-style:none}）把 Markdown
+   预览的列表编号/圆点吞掉，导致与实时预览（Crepe 自有编号方案）不一致（用户反馈
+   「前几行没有行号」）；在此恢复标准标记，嵌套层级跟随浏览器默认 */
+.md-preview :deep(ol) {
+  list-style-type: decimal;
+}
+.md-preview :deep(ul) {
+  list-style-type: disc;
+}
+.md-preview :deep(ul ul) {
+  list-style-type: circle;
+}
 .md-preview :deep(li) {
   margin: 0;
 }

@@ -40,11 +40,22 @@
 | 8 | 2026-09-29 | `ddb86e8` | v0.7.2 | `c7d8d86` | 合并上游 8 提交（子待办拖拽挂载/排序/日历已完成、全局搜索与 AI 对话全局快捷键、扩展中心交互重做、图标原样显示、稍后再提示等），零冲突；56 文件 +1719/-465 |
 | 9 | 2026-10-04 | `c7d8d86` | v0.7.5 | `1d58ac0` | 一次性合并上游 v0.7.3/v0.7.4/v0.7.5 共 5 提交（速达书签导入/桌面扫描/小类层级/批量管理、多屏窗口记忆修复、待办置顶分组、service 自动信任、快捷键单独禁用等），零冲突；59 文件 +4530/-593 |
 | 10 | 2026-10-05 | `1d58ac0` | v0.7.6 | `4a8b00c` | 合并上游 2 提交（速达自定义分区、工作台布局存为默认、高清图标提取、日历逾期淡红底纹与条目优先显示 #28 等），零冲突；32 文件 +2505/-375 |
-| 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | 待提交 | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
+| 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
+| 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 
 ---
 
 ## 三、变更详情
+
+### #12（2026-10-05）修复分屏预览列表编号消失（与实时预览不一致）
+
+**现象**（用户反馈）：分屏预览与实时预览显示不一样，有序列表「前几行没有行号」（编号）。
+
+**根因**：上游 v0.7.3-v0.7.6 期间的全局样式重置（Tailwind preflight 风格的 `ol,ul,menu{list-style:none}`）把 Markdown 渲染（md-preview）的列表标记吞掉；实时预览（Crepe）的有序列表编号是 DOM 文本节点（自有方案）不受影响，故两预览不一致。
+
+**修复**：`NoteEditor.vue` 预览样式恢复列表标记：ol=decimal、ul=disc、嵌套 ul=circle（`.md-preview[data-v] ul` 优先级高于元素选择器 reset，稳定生效）。
+
+**验证**：分屏预览 OL `list-style-type: decimal` ✓；实时预览 li 文本含编号 ✓；两侧视觉一致。
 
 ### #11（2026-10-05）修复速记编辑器主题全失效（CSP nonce 阻断动态样式）
 
