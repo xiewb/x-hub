@@ -25,9 +25,13 @@ const monthLabel = computed(() => `${cursor.value.getFullYear()} 年 ${cursor.va
 
 const topTodos = computed(() => store.state.todos.filter((t) => t.parent_id == null))
 
+/** 未完成且截止日早于今天（红色 chip 与格子红底标记共用的唯一口径） */
+const isOverdue = (t: Todo) => !t.done && dueBadge(t, today.value)?.kind === 'over'
+
 /** 真实条目落格：未完成按 due_at；**已完成也显示**——有截止落原日期，
  *  没截止则落在完成当天（completed_at，UTC 字符串需补 Z 解析），用删除线淡显。
- *  同一格内未完成排在已完成前面（MAX_CHIPS 截断时不至于把待办挤掉）。 */
+ *  同一格内未完成排在已完成前面，未完成内部**逾期优先**——MAX_CHIPS 截断时
+ *  红色 chip 不会被正常条目挤进「+N」（同天混合逾期与正常时的唯一诚实显示方式）。 */
 const realByDay = computed(() => {
   const map = new Map<string, Todo[]>()
   for (const t of topTodos.value) {
@@ -38,8 +42,25 @@ const realByDay = computed(() => {
     if (list) list.push(t)
     else map.set(key, [t])
   }
-  for (const list of map.values()) list.sort((a, b) => Number(a.done) - Number(b.done))
+  for (const list of map.values()) {
+    list.sort((a, b) => {
+      const d = Number(a.done) - Number(b.done)
+      if (d !== 0) return d
+      return Number(isOverdue(b)) - Number(isOverdue(a))
+    })
+  }
   return map
+})
+
+/** 含未完成逾期待办的日期（格子淡红底标记）：按**全量**条目判定（不按截断后的 chip），
+ *  红标记不因截断丢失；周期待办虚拟实例不参与（与 chip 的 late 口径一致）。
+ *  全部完成后 isOverdue 不再命中，标记随 done 状态自动消退。 */
+const overdueByDay = computed(() => {
+  const set = new Set<string>()
+  for (const [key, list] of realByDay.value) {
+    if (list.some(isOverdue)) set.add(key)
+  }
+  return set
 })
 
 const virtualByDay = computed(() => {
@@ -153,7 +174,7 @@ const chipsByDay = computed(() => {
         v-for="c in cells"
         :key="c.key"
         class="tc-cell"
-        :class="{ out: c.out, today: c.today }"
+        :class="{ out: c.out, today: c.today, 'has-overdue': overdueByDay.has(c.key) }"
       >
         <span class="tc-day">{{ c.day }}</span>
         <div class="tc-chips">
@@ -161,7 +182,7 @@ const chipsByDay = computed(() => {
             v-for="t in (chipsByDay.get(c.key)?.real ?? [])"
             :key="'r' + t.id"
             class="tc-chip real"
-            :class="{ done: t.done, late: !t.done && dueBadge(t, today)?.kind === 'over' }"
+            :class="{ done: t.done, late: isOverdue(t) }"
             :title="t.done ? `${t.title}（已完成）` : t.title"
           >{{ t.title }}</span>
           <span
@@ -190,24 +211,33 @@ const chipsByDay = computed(() => {
 }
 .tc-header {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 6px;
   margin-bottom: 6px;
 }
 .tc-title {
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
   margin: 0;
   font-size: 0.8125rem;
   font-weight: 600;
+  white-space: nowrap;
   color: var(--text-1);
 }
+.tc-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .tc-title :deep(svg) {
+  flex-shrink: 0;
   color: var(--brand-500);
 }
 .tc-month {
   font-size: 0.6875rem;
+  white-space: nowrap;
   color: var(--text-3);
 }
 .tc-spacer {
@@ -219,6 +249,7 @@ const chipsByDay = computed(() => {
   justify-content: center;
   width: 22px;
   height: 22px;
+  flex-shrink: 0;
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -237,16 +268,18 @@ const chipsByDay = computed(() => {
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
-  grid-auto-rows: minmax(0, 1fr);
+  grid-template-rows: 14px repeat(6, minmax(0, 1fr));
   gap: 2px;
 }
 .tc-dow {
   font-size: 0.5625rem;
+  line-height: 14px;
   font-weight: 700;
   color: var(--text-4);
   text-align: center;
 }
 .tc-cell {
+  min-width: 0;
   min-height: 0;
   padding: 2px 3px;
   border: 1px solid var(--border-soft);
@@ -260,8 +293,17 @@ const chipsByDay = computed(() => {
 .tc-cell.today {
   border-color: var(--brand-500);
 }
+/* 含未完成逾期待办的日期：淡红底扫视信号（issue #29）。用底色而非边框——
+ * 与「今天」的品牌色边框分属不同视觉通道，今天恰有逾期时两者叠加不冲突；
+ * 色调压得比 late chip 的实底轻一档，格内红 chip 仍靠描边区分。 */
+.tc-cell.has-overdue {
+  background: color-mix(in srgb, var(--c-red-soft) 50%, var(--bg-card-soft));
+}
 .tc-day {
+  /* 独立行盒避免继承正文行高，紧凑格子也能容纳完整日期。 */
+  display: block;
   font-size: 0.5625rem;
+  line-height: 12px;
   color: var(--text-4);
   font-variant-numeric: tabular-nums;
 }
@@ -302,5 +344,30 @@ const chipsByDay = computed(() => {
 .tc-more-cnt {
   font-size: 0.5rem;
   color: var(--text-4);
+}
+/* 宿主 .dash-cell 已提供尺寸容器；窄卡片将月份放到第二行。
+ * 隐藏标题时沿用悬浮工具栏，避免改变其定位与交互。 */
+@container (max-width: 320px) {
+  .tc-header:not(.hd-float) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 22px 22px;
+    row-gap: 2px;
+  }
+  .tc-header:not(.hd-float) .tc-title {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .tc-header:not(.hd-float) .tc-month {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    line-height: 14px;
+  }
+  .tc-header:not(.hd-float) .tc-nav {
+    grid-row: 1;
+  }
+  .tc-header:not(.hd-float) .tc-spacer,
+  .tc-header:not(.hd-float) .tc-more {
+    display: none;
+  }
 }
 </style>

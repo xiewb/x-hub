@@ -98,6 +98,7 @@ const {
   snippetList,
   todoGroups,
   todoDayMarks,
+  todoOverdueMarks,
   pendingCount,
   doneCount,
   recentList,
@@ -179,6 +180,8 @@ const extName = computed(() => dashModuleTitle(props.modId))
  *  todoDayMarks 是全量口径），缩印里不另算一套。 */
 const calCells = computed(() => calendarGrid(previewDate.value, previewDate.value))
 const calMarked = todoDayMarks
+/** 含未完成逾期的日期：格子淡红底，与真卡 `.tc-cell.has-overdue` 同口径同色 */
+const calOverdue = todoOverdueMarks
 const kind = computed(() => {
   const id = props.modId
   if (id.startsWith('ext:')) return 'ext'
@@ -486,7 +489,7 @@ const kind = computed(() => {
       </h3>
       <div class="cal-mini">
         <div v-for="d in ['一', '二', '三', '四', '五', '六', '日']" :key="d" class="cal-dow">{{ d }}</div>
-        <div v-for="c in calCells" :key="c.key" class="cal-cell" :class="{ out: c.out, today: c.today }">
+        <div v-for="c in calCells" :key="c.key" class="cal-cell" :class="{ out: c.out, today: c.today, 'has-overdue': calOverdue.has(c.key) }">
           <span class="cal-day">{{ c.day }}</span>
           <i v-if="calMarked.get(c.key)" class="cal-dot" :title="`${calMarked.get(c.key)} 条待办`"></i>
         </div>
@@ -587,16 +590,19 @@ const kind = computed(() => {
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
-  grid-auto-rows: minmax(0, 1fr);
+  grid-template-rows: calc(14 * var(--u)) repeat(6, minmax(0, 1fr));
   gap: calc(2 * var(--u));
 }
 .cal-dow {
   font-size: calc(9 * var(--u));
+  line-height: calc(14 * var(--u));
   font-weight: 700;
   color: var(--text-4);
   text-align: center;
 }
 .cal-cell {
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -615,8 +621,14 @@ const kind = computed(() => {
 .cal-cell.today {
   border-color: var(--brand-500);
 }
+/* 与真卡 .tc-cell.has-overdue 同一条规则：色值/比例改任一处必须两边同步 */
+.cal-cell.has-overdue {
+  background: color-mix(in srgb, var(--c-red-soft) 50%, var(--bg-card-soft));
+}
 .cal-day {
+  flex-shrink: 0;
   font-size: calc(9 * var(--u));
+  line-height: calc(12 * var(--u));
   color: var(--text-4);
   font-variant-numeric: tabular-nums;
 }
