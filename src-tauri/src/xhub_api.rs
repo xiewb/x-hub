@@ -2225,6 +2225,7 @@ mod tests {
             min_size: None,
             backend: None,
             description: String::new(),
+            author: None,
             config: Map::new(),
             module_variants: vec![],
             module_options: Default::default(),

@@ -291,6 +291,11 @@ export interface AppConfig {
   search_shortcut: string
   /** AI 对话呼出快捷键（默认 Ctrl+Shift+K） */
   chat_shortcut: string
+  /** 各全局快捷键是否启用（默认开）：关掉 = 注销热键但保留键值，重开即恢复 */
+  global_shortcut_enabled: boolean
+  clipboard_shortcut_enabled: boolean
+  search_shortcut_enabled: boolean
+  chat_shortcut_enabled: boolean
   /** 剪贴板历史最大条数（含置顶） */
   clipboard_max_items: number
   /** 非置顶记录保留天数 */
@@ -323,12 +328,16 @@ export interface AppConfig {
   note_editor_mode: string
   /** service 扩展运行时策略：auto / builtin / system */
   runtime_strategy: string
+  /** 全局自动信任 service 扩展（默认关）：开启后新装/更新的 service 扩展无需逐个「去授权」 */
+  service_auto_trust: boolean
   /** 固定到左侧栏的扩展 id 列表（点击侧栏菜单即在主区打开对应扩展） */
   sidebar_extensions: string[]
   /** 扩展「默认打开方式」映射：extId → view / window / drawer（未设置时侧栏点击默认 view） */
   extension_open_modes: Record<string, string>
   /** 扩展「链接打开方式」映射：extId → inapp（应用内浏览器，默认）/ browser（系统浏览器） */
   extension_link_modes: Record<string, string>
+  /** 扩展中心列表点击行为：detail（默认，点行看详情）/ open（点行直接打开） */
+  extension_row_click: 'detail' | 'open'
   /** 开机自启动（登录 Windows 时自动驻留托盘） */
   run_at_startup: boolean
   /** 自动升级总开关（默认开启） */
@@ -416,6 +425,8 @@ export interface ExtensionEntry {
   open_in: string[]
   permissions: string[]
   description: string
+  /** 作者署名（manifest.author；发布弹窗预填，市场卡片与详情页展示） */
+  author: string | null
   /** 图标文件绝对路径（存在时才非空） */
   icon: string | null
   /** 扩展目录绝对路径 */
@@ -821,6 +832,24 @@ export interface InstalledAppInfo {
   icon: string | null
 }
 
+/** 桌面扫描结果项；kind 为展示分类，`folder` 导入速达时归入 `file` 大类 */
+export interface DesktopEntry {
+  name: string
+  target: string
+  icon: string | null
+  kind: 'app' | 'web' | 'file' | 'folder'
+  /** 桌面快捷方式原始路径（仅 .lnk/.url 有），供「导入后清理桌面快捷方式」 */
+  source: string | null
+}
+
+/** 浏览器书签项（Chromium 系 Bookmarks JSON） */
+export interface BrowserBookmark {
+  name: string
+  target: string
+  folder: string
+  browser: string
+}
+
 export interface SystemInfo {
   cpuUsage: number
   memUsedMb: number
@@ -1047,6 +1076,16 @@ export const tauriApi = {
     invoke<void>('delete_detached_sticky', { slot }),
   parseDroppedPath: (path: string) => invoke<DroppedAppInfo>('parse_dropped_path', { path }),
   scanInstalledApps: () => invoke<InstalledAppInfo[]>('scan_installed_apps'),
+  /** 扫描用户桌面一层（不递归）：快捷方式/网页/应用/文件/文件夹 */
+  scanDesktop: () => invoke<DesktopEntry[]>('scan_desktop'),
+  /** 删除桌面上的快捷方式（仅 .lnk/.url，且必须是用户桌面直接子项）；返回删除数量 */
+  deleteDesktopShortcuts: (paths: string[]) =>
+    invoke<number>('delete_desktop_shortcuts', { paths }),
+  /** 读取 Chromium 系浏览器书签（Chrome/Edge/Brave/Chromium），不读历史 */
+  scanBrowserBookmarks: () => invoke<BrowserBookmark[]>('scan_browser_bookmarks'),
+  /** 批量抓取网页图标（favicon）：返回 原样 target → 图标绝对路径（抓不到为 null）；同域名只抓一次 */
+  fetchFavicons: (targets: string[]) =>
+    invoke<Record<string, string | null>>('fetch_favicons', { targets }),
   getRunningProcesses: () => invoke<string[]>('get_running_processes'),
   importIconFile: (source: string) =>
     invoke<string | null>('import_icon_file', { source }),
@@ -1080,6 +1119,9 @@ export const tauriApi = {
   setGlobalShortcut: (value: string) => invoke<string>('set_global_shortcut', { value }),
   setSearchShortcut: (value: string) => invoke<string>('set_search_shortcut', { value }),
   setChatShortcut: (value: string) => invoke<string>('set_chat_shortcut', { value }),
+  /** 启用/禁用某个可自定义全局快捷键（禁用保留键值，只注销热键） */
+  setShortcutEnabled: (kind: 'main' | 'clipboard' | 'search' | 'chat', enabled: boolean) =>
+    invoke<void>('set_shortcut_enabled', { kind, enabled }),
   getRunAtStartup: () =>
     invoke<AutostartStatus>('get_run_at_startup'),
   setRunAtStartup: (enabled: boolean) => invoke<void>('set_run_at_startup', { enabled }),
@@ -1289,7 +1331,8 @@ export const tauriApi = {
   /** 撤销某台设备（换机/设备丢失时用） */
   accountRevokeDevice: (id: number) => invoke<unknown>('account_revoke_device', { id }),
   // ---- 扩展发布（打包上传 / 我的提交 / 撤回） ----
-  /** newVersion 非空时，Rust 端会先把它写回扩展 manifest.json（须大于当前版本）再打包上传 */
+  /** newVersion 非空时，Rust 端会先把它写回扩展 manifest.json（须大于当前版本）再打包上传；
+   *  author 非空且与 manifest 当前署名不同时同样先回写 `author` 字段（市场卡片与详情页展示用它） */
   devSubmit: (
     id: string,
     changelog?: string,
@@ -1297,6 +1340,7 @@ export const tauriApi = {
     homepage?: string,
     screenshots?: string[],
     newVersion?: string,
+    author?: string,
   ) =>
     invoke<SubmitResult>('dev_submit', {
       id,
@@ -1305,9 +1349,15 @@ export const tauriApi = {
       homepage: homepage ?? null,
       screenshots: screenshots && screenshots.length ? screenshots : null,
       newVersion: newVersion ?? null,
+      author: author ?? null,
     }),
   /** 读本地图片为 data URL（发布弹窗的截图缩略图预览用；作者选的图不在资产白名单目录里） */
   readImageDataUrl: (path: string) => invoke<string>('read_image_data_url', { path }),
+  /**
+   * 「引用上一版截图」：下载市场清单里该扩展已上架版本的截图 URL 到本地临时文件。
+   * 返回成功下载的本地路径列表（失效/非图片的 URL 会被跳过；全部失败时 reject）。
+   */
+  fetchRemoteScreenshots: (urls: string[]) => invoke<string[]>('fetch_remote_screenshots', { urls }),
   devListSubmissions: (page?: number, pageSize?: number) =>
     invoke<DevSubmissionList>('dev_list_submissions', {
       page: page ?? null,
