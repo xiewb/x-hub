@@ -39,11 +39,22 @@
 | 7 | 2026-09-28 | `a03055c` | v0.7.1 | `ddb86e8` | 所见即所得三层修复（换行/排版/字体）+ 表格挂载崩溃根因修复（forkHighlight toMarkdownExtensions 覆盖 bug）；CDP 双侧采样验证 |
 | 8 | 2026-09-29 | `ddb86e8` | v0.7.2 | `c7d8d86` | 合并上游 8 提交（子待办拖拽挂载/排序/日历已完成、全局搜索与 AI 对话全局快捷键、扩展中心交互重做、图标原样显示、稍后再提示等），零冲突；56 文件 +1719/-465 |
 | 9 | 2026-10-04 | `c7d8d86` | v0.7.5 | `1d58ac0` | 一次性合并上游 v0.7.3/v0.7.4/v0.7.5 共 5 提交（速达书签导入/桌面扫描/小类层级/批量管理、多屏窗口记忆修复、待办置顶分组、service 自动信任、快捷键单独禁用等），零冲突；59 文件 +4530/-593 |
-| 10 | 2026-10-05 | `1d58ac0` | v0.7.6 | 待提交 | 合并上游 2 提交（速达自定义分区、工作台布局存为默认、高清图标提取、日历逾期淡红底纹与条目优先显示 #28 等），零冲突；32 文件 +2505/-375 |
+| 10 | 2026-10-05 | `1d58ac0` | v0.7.6 | `4a8b00c` | 合并上游 2 提交（速达自定义分区、工作台布局存为默认、高清图标提取、日历逾期淡红底纹与条目优先显示 #28 等），零冲突；32 文件 +2505/-375 |
+| 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | 待提交 | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 
 ---
 
 ## 三、变更详情
+
+### #11（2026-10-05）修复速记编辑器主题全失效（CSP nonce 阻断动态样式）
+
+**现象**：速记源码/实时预览表现不一致、源码无法编辑、两视图无滚动条（用户截图）。CDP 诊断发现 CodeMirror 主题 style 元素在 DOM 中存在、文本完好，但 `sheet === null`——浏览器拒绝为其创建样式表，117 条主题规则全部无效（含 `.cm-scroller{overflow-x:auto}` 高度/滚动/光标/选区），导致内容溢出无法滚动、编辑体验崩坏；console 报 CSP 违规。
+
+**根因**：Tauri 运行时向下发的 CSP 追加了 `'nonce-...'`（style-src），而 CSP 规范规定 **nonce/hash 存在时 'unsafe-inline' 被忽略**——配置中本来允许的内联样式被实际禁止。index.html 静态元素在构建时未加 nonce，运行时动态注入的样式（CodeMirror StyleModule、highlight 主题等）全部被阻断。
+
+**修复**：`tauri.conf.json` security 段增加 `"dangerousDisableAssetCspModification": true`，禁止 Tauri 做 CSP nonce 改写，使 `'unsafe-inline'` 按原配置意图生效。防护影响：与原配置（本就允许内联）等价，无额外风险面。
+
+**验证**：重建后 CDP 检查：CM 主题 style sheet 正常创建（117 条规则），`.cm-scroller` overflow 恢复 auto/auto、可滚动（max 3894px）、execCommand 编辑成功；源码 26 行与实时预览列表渲染一一对应；分屏/实时预览/源码三态正常。另：`rustc` 一次 STATUS_STACK_BUFFER_OVERRUN 崩溃为 Windows 偶发，重试即过。
 
 ### #10（2026-10-05）合并上游 v0.7.6
 
