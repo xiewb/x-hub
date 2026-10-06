@@ -1769,19 +1769,9 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   background: color-mix(in srgb, var(--c-red) 10%, transparent);
 }
 
-/* 单换行视觉统一（fork 修复）：remarkLineBreak 把源码内单换行解析为 inline hardbreak，
- * milkdown 默认将其 toDOM 为含一个空格的 span（文字连排），而实时预览渲染为 <br>（真换行），
- * 导致编辑态与预览不一致。这里把该 span 变为零高度强制断行，与预览 <br> 视觉对齐。 */
-.crepe-root .milkdown span[data-type='hardbreak'][data-is-inline='true'] {
-  display: block;
-  height: 0;
-  overflow: hidden;
-  font-size: 0;
-  line-height: 0;
-  white-space: pre;
-}
-
-/* ==高亮== 扩展语法的视觉：富文本内 mark 元素（fork 自定义 schema 输出） */
+/* ==高亮== 扩展语法的视觉：富文本内 mark 元素（fork 自定义 schema 输出）。
+ * （原单换行 hardbreak 强制断行规则移至下方非 scoped 块：ProseMirror 动态创建的
+ *   span 不携带 scoped 的 data-v 属性，scoped 规则永远不命中。） */
 .crepe-root mark.hl-mark,
 .md-preview mark.hl-mark {
   padding: 0 3px;
@@ -2319,6 +2309,20 @@ function onEditorAreaMouseDown(e: MouseEvent) {
 </style>
 
 <style>
+/* 单换行视觉统一（fork 修复）：remarkLineBreak 把源码内单换行解析为 inline hardbreak，
+ * milkdown 将其 toDOM 为含一个空格的 span（文字连排），与实时预览 <br> 不一致。
+ * 这里把该 span 变为零高度强制断行，与预览 <br> 视觉对齐。
+ * 【必须在非 scoped 块】：ProseMirror 动态创建的 span 无 data-v 属性，
+ *   scoped 规则会附加 [data-v] 到 span 上永远不命中（曾致多行内容连排成一行）。 */
+.crepe-root .milkdown span[data-type='hardbreak'][data-is-inline='true'] {
+  display: block;
+  height: 0;
+  overflow: hidden;
+  font-size: 0;
+  line-height: 0;
+  white-space: pre;
+}
+
 /* Crepe 主题变量对齐应用设计令牌（全局块：高优先级选择器压过 frame.css 的 .milkdown 定义）。
    亮色基线 + [data-theme="dark"] 暗色覆盖，替代 Crepe 缺失的动态主题切换（Milkdown #1839） */
 .crepe-root .milkdown {

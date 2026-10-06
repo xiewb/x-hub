@@ -42,10 +42,28 @@
 | 10 | 2026-10-05 | `1d58ac0` | v0.7.6 | `4a8b00c` | 合并上游 2 提交（速达自定义分区、工作台布局存为默认、高清图标提取、日历逾期淡红底纹与条目优先显示 #28 等），零冲突；32 文件 +2505/-375 |
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
+| 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
 
 ---
 
 ## 三、变更详情
+
+### #13（2026-10-06）修复两预览换行语义不一致（`<br />` 字面显示 / 多行挤成一行）
+
+**现象**（用户反馈）：① 源码中的 `<br />` 在分屏预览显示为字面文本 `<br />`，实时预览中为空（不显示）；② 源码多行文本（连续斜体行、`1\.` 行）在实时预览挤成一行显示。
+
+**根因**（三处叠加）：
+
+1. **`<br />` 字面显示**：`markdownHtml.ts` 的 `escapeProseHtml` 把 `<br />` 当 raw tag 转义为字面文本；但该设计前提已过时——Crepe/ProseMirror 实际会把 `<br />` 解析为 hardbreak 节点，实时预览根本不会显示字面文本，转义反而制造了两侧行为分裂（分屏字面、实时换行）。
+2. **实时预览多行挤一行**：hardbreak 强制断行规则（`display:block`）原写在 `<style scoped>` 块，Vue 编译后最后选择器元素附加 `[data-v-xxx]`，而 ProseMirror 动态创建的 hardbreak span 无该属性，规则永不命中（CSSOM 规则数/matches/computed display 三重实证）。
+3. **分屏预览单换行不换行**：`renderNoteMarkdown`（marked）未开 `breaks`，源码单换行不产生 `<br>`；而实时预览侧 preset-commonmark 的 remarkLineBreak 把单换行解析为 hardbreak（换行），两侧软换行语义不一致。
+
+**修复**：
+
+- `markdownHtml.ts`：RAW_TAG 转义豁免 `<br\b` 变体（`<br />`/`<br>` 透传，marked 内联 HTML 本就透传，渲染为真换行）；`renderNoteMarkdown` 加 `breaks: true`（单换行→`<br>`，对齐“源码单换行=换行显示”语义，与实时预览 remarkLineBreak 一致）。
+- `NoteEditor.vue`：hardbreak 断行规则从 scoped 块移至非 scoped 块（`.milkdown` 前缀全局规则，与既有全局排版规则同风格；注释记录 scoped data-v 陷阱）。
+
+**验证**：实时预览 hardbreak span `display:block`、5 处断行生效；分屏预览 literalBr=0（`<br />` 已渲染为真换行）、含斜体段篧 5 个行框（breaks:true 生效）；两侧一致。
 
 ### #12（2026-10-05）修复分屏预览列表编号消失（与实时预览不一致）
 

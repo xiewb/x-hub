@@ -148,16 +148,29 @@ function escapeProseHtml(text: string): string {
   if (!/</.test(text)) return text
   return mapMarkdownLines(text, (line, kind) => {
     if (kind !== 'prose') return line
-    return mapInlineProse(line, (prose) => prose.replace(RAW_TAG, (tag) => `\\<${tag.slice(1, -1)}\\>`))
+    return mapInlineProse(line, (prose) =>
+      prose.replace(RAW_TAG, (tag) => {
+        // <br> 变体不转义：实时预览（Crepe）把 <br /> 解析为换行（hardbreak），
+        // 分屏侧 marked 本就透传内联 HTML，渲染为真换行，两侧保持一致；其余未知标签仍转义为字面
+        if (/^<br\b/i.test(tag)) return tag
+        return `\\<${tag.slice(1, -1)}\\>`
+      }),
+    )
   })
 }
 
-/** 速记分屏的只读预览。按 CommonMark/GFM 渲染（不把单个换行强转成 <br>，与 Crepe 序列化对齐）。 */
+/** 速记分屏的只读预览。与实时预览语义对齐：
+ * - breaks:true：源码内单换行渲染为 <br>（与实时预览 remarkLineBreak 的 hardbreak 一致，
+ *   此前两侧对同一源码的换行处理不同，表现为多行内容连排成一行）；
+ * - 正文内 <br /> 透传为真换行（marked 本就透传内联 HTML，其余未知标签已在
+ *   escapeProseHtml 转义为字面，DOMPurify 兜底消毒，安全性不变）；
+ * - 与 Crepe 序列化对齐由 restoreCrepeMarkdown/loosenHtmlBreaks 承担。 */
 export function renderNoteMarkdown(text: string): string {
   if (!text) return ''
   const html = marked.parse(escapeProseHtml(loosenHtmlBreaks(text)), {
     async: false,
     gfm: true,
+    breaks: true,
     renderer: noteRenderer,
   }) as string
   return sanitizeNoteHtml(html)
