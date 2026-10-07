@@ -2,6 +2,8 @@
 
 本仓库为 [dckxx/x-hub](https://github.com/dckxx/x-hub)（上游）的 fork，fork 仓库为 [xiewb/x-hub](https://github.com/xiewb/x-hub)。
 
+> ⚠️ 合并上游前必读 [MERGE-GUIDE.md](MERGE-GUIDE.md)：三仓库拓扑、七步流程、冲突解决约定与历次决策索引。新冲突模式解决后须回写该文档。
+
 本文件记录：
 
 - 每次 fork / 合并上游时的时间和版本基点；
