@@ -43,6 +43,21 @@
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 | 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
+| 14 | 2026-10-07 | `33bbcd2`→`6e302db` | v0.8.0 | 待提交 | 合并上游 4 提交（速记大改造：文件夹树/回收站体系/双链/图片 GC/AI 美化/导入导出，日历待办横排 #30，速记树拖拽落点与 AI 整理丢图修复，CI 升 Node 24）；58 文件 +8079/-756。冲突 8 文件 23 块手工合并：回收站双实现归一（上游为主+fork 兼容层 soft_delete/list_trash/empty_trash），NoteEditor 双特性并集（fork 工具栏/查找替换/大纲/CodeMirror 源码模式 + 上游 AI 美化/双链面板/图片语法修复，textarea 触点适配 CM 实例 API），NoteList.vue 随上游删除（SpeednoteView 取代，fork 版留存于历史） |
+
+---
+
+### #14（2026-10-07）合并上游 v0.8.0：速记大改造与 fork 编辑器增强的双特性并集
+
+**上游内容**（4 提交，58 文件 +8079/-756）：速记全面改造（docs/speednote-plan.md）——笔记文件夹树（NoteFolderTree.vue）、回收站体系（trash/purge_expired/purge_all，含保留天数自动清理）、双链（[[引用]] + 入链/出链面板 + 改名断链防护）、剪藏 source_url 与图片语法修复（noteImageSyntax）、AI 美化（markdownBeautify）与 AI 对话、笔记导入导出（note_io.rs）；另含日历待办横排修复（#30）、速记树拖拽落点与 AI 整理丢图修复、CI 升级 Node 24。
+
+**冲突解决策略**（8 文件 23 块）：
+
+1. **回收站双实现归一**：fork（#3）与上游各自独立实现了软删/回收站。以上游为主基线（note.rs 全取上游），保留 fork 旧 API 作薄兼容层（`soft_delete`→trash、`purge`→delete、`list_trash`、`empty_trash`），`commands.rs` 去重后两套命令并存（旧 UI/扩展桥用 fork 口径，新 SpeednoteView 用上游口径），`lib.rs` 去除重复注册。
+2. **NoteEditor.vue 双特性并集**：fork 侧（格式工具栏/查找替换/大纲导航/==高亮==/CodeMirror 6 源码模式）与上游侧（AI 美化/双链面板/wiki 补全/树 emoji 图标/来源链接）无同名冲突，脚本区两侧全保留；模板区结构性冲突手工并集——上游 `ed-main`+双链面板外壳内嵌 fork 三模式（CodeMirrorSource 取代上游原生 textarea），上游按 textarea API 写的美化光标映射/AI 应用触点改写为 CM 实例 API（`getSelection().from` / `view.dispatch({selection})`）；CSS 双方新增规则全保留，`.ed-body` 双定义归一（row 向 + position:relative 兼容查找替换浮条）。
+3. **NoteList.vue 随上游删除**：上游以 SpeednoteView/NoteFolderTree 重构笔记列表 UI，fork 版（含标签全局删除/筛选栏修复/垃圾箱面板）不再被引用，接受删除（`git show c1920ce:src/components/NoteList.vue` 可取回；其中仍有效的 fork 逻辑已在上游新 UI 中有对应实现或后续按需移植）。
+
+**验证**：`npm run build`（vue-tsc + vite）通过；Rust 侧 `cargo check` 通过。
 
 ---
 
