@@ -45,7 +45,8 @@
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 | 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
-| 14 | 2026-10-07 | `33bbcd2`→`6e302db` | v0.8.0 | 待提交 | 合并上游 4 提交（速记大改造：文件夹树/回收站体系/双链/图片 GC/AI 美化/导入导出，日历待办横排 #30，速记树拖拽落点与 AI 整理丢图修复，CI 升 Node 24）；58 文件 +8079/-756。冲突 8 文件 23 块手工合并：回收站双实现归一（上游为主+fork 兼容层 soft_delete/list_trash/empty_trash），NoteEditor 双特性并集（fork 工具栏/查找替换/大纲/CodeMirror 源码模式 + 上游 AI 美化/双链面板/图片语法修复，textarea 触点适配 CM 实例 API），NoteList.vue 随上游删除（SpeednoteView 取代，fork 版留存于历史） |
+| 15 | 2026-10-08 | `6e302db`→`a85e1db` | v0.8.0+ | 待提交 | 合并 v0.8.0 标签后上游 2 提交：CI 升级 GitHub Actions 到 Node 24 运行时（ci.yml/release.yml）、更新交流群二维码（② 群，新增 assets/wechat-group-qr.png）；纯 CI/文档变更零冲突，fork 特性无损 |
+| 14 | 2026-10-07 | `33bbcd2`→`6e302db` | v0.8.0 | 已提交 `7241450` | 合并上游 4 提交（速记大改造：文件夹树/回收站体系/双链/图片 GC/AI 美化/导入导出，日历待办横排 #30，速记树拖拽落点与 AI 整理丢图修复，CI 升 Node 24）；58 文件 +8079/-756。冲突 8 文件 23 块手工合并：回收站双实现归一（上游为主+fork 兼容层 soft_delete/list_trash/empty_trash），NoteEditor 双特性并集（fork 工具栏/查找替换/大纲/CodeMirror 源码模式 + 上游 AI 美化/双链面板/图片语法修复，textarea 触点适配 CM 实例 API），NoteList.vue 随上游删除（SpeednoteView 取代，fork 版留存于历史） |
 
 ---
 
