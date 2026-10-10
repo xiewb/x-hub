@@ -3792,7 +3792,21 @@ pub fn scan_browser_tabs() -> Result<BrowserTabScan, String> {
             ("Tabbit", r"Tabbit Browser\User Data"),
         ];
         for (browser, rel) in vendors {
-            let count = collect_chromium_tabs(local.join(rel).join("Sessions"), browser, &mut items);
+            // Sessions 在每个 profile 目录下（User Data/<Default|Profile N>/Sessions）
+            let user_data = local.join(rel);
+            let Ok(profiles) = std::fs::read_dir(&user_data) else {
+                continue;
+            };
+            let mut count = 0usize;
+            let mut profile_dirs: Vec<std::path::PathBuf> = profiles
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && p.join("Sessions").is_dir())
+                .collect();
+            profile_dirs.sort(); // Default 优先（字典序）
+            for pd in profile_dirs {
+                count += collect_chromium_tabs(pd.join("Sessions"), browser, &mut items);
+            }
             if count > 0 {
                 browsers_done.push(browser.to_string());
             }
