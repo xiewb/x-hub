@@ -10,7 +10,7 @@ export interface ScanItem {
   kind: 'app' | 'web' | 'file' | 'folder'
   /** 书签来源文件夹（按 folder 分组展示） */
   folder?: string
-  /** 书签来源浏览器（Chrome/Edge/Brave/Chromium/Tabbit）；书签树顶层按浏览器分组勾选 */
+  /** 书签来源浏览器（Chrome/Edge/Brave/Chromium/Tabbit/Firefox）；书签树顶层按浏览器分组勾选 */
   browser?: string
   /** 导入时归入的速达小类名（书签按文件夹归类时填；null = 默认归类/未归类） */
   category?: string | null
@@ -221,7 +221,7 @@ interface BookmarkNode {
 }
 
 /** 浏览器展示排序（检测不到的排在后面），顶层浏览器节点按此排序 */
-const BROWSER_ORDER = ['Chrome', 'Edge', 'Brave', 'Chromium', 'Tabbit']
+const BROWSER_ORDER = ['Chrome', 'Edge', 'Brave', 'Chromium', 'Tabbit', 'Firefox']
 
 /** 条目在树中的路径分段：顶层 = 浏览器，其后为原始目录分段（空目录归「未分类」） */
 function treeSegments(it: ScanItem): string[] {

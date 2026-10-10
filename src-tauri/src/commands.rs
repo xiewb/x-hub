@@ -3515,6 +3515,34 @@ pub fn scan_browser_bookmarks(dedupe: bool) -> Result<BrowserBookmarkScan, Strin
         }
     }
 
+    // Firefox：非 Chromium 系，书签在 roaming 配置目录的 places.sqlite（SQLite）。
+    // 浏览器运行时该文件被独占锁定，复制到临时目录后只读打开（见 collect_firefox_bookmarks）
+    if let Some(roaming) = dirs::data_dir() {
+        let ff_root = roaming.join(r"Mozilla\Firefox\Profiles");
+        if let Ok(dirs) = std::fs::read_dir(&ff_root) {
+            for profile in dirs.flatten() {
+                let path = profile.path();
+                if !path.is_dir() || !path.join("places.sqlite").is_file() {
+                    continue;
+                }
+                let profile_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut counted = 0usize;
+                collect_firefox_bookmarks(&path, "Firefox", &mut found, &mut counted, &mut skipped);
+                if counted > 0 {
+                    profiles.push(BrowserProfileStat {
+                        browser: "Firefox".to_string(),
+                        profile: profile_name,
+                        count: counted,
+                    });
+                }
+            }
+        }
+    }
+
     // 浏览器内按 URL 去重（同一浏览器多配置文件/文件夹的相同网址只留一条）；
     // 跨浏览器不合并（各浏览器独立展示）；关掉则原样保留
     let raw_total = found.len();
@@ -3560,6 +3588,104 @@ fn dedupe_within_browser(found: &mut Vec<BrowserBookmark>, dedupe: bool) -> usiz
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     found.retain(|b| seen.insert((b.browser.clone(), b.target.to_lowercase())));
     raw_total - found.len()
+}
+
+/// 读取单个 Firefox profile 的书签（places.sqlite，moz_bookmarks/moz_places）。
+/// 运行中的 Firefox 会独占锁定该文件：先复制（含 -wal/-shm 未合并写入）到临时目录，
+/// 只读打开副本后递归 CTE 展开文件夹路径。根层 tags 子树是标签页容器非用户书签，整树跳过。
+fn collect_firefox_bookmarks(
+    profile_dir: &std::path::Path,
+    browser: &str,
+    out: &mut Vec<BrowserBookmark>,
+    counted: &mut usize,
+    skipped: &mut usize,
+) {
+    let tmp_dir = std::env::temp_dir().join(format!("xhub_ff_{}", std::process::id()));
+    if std::fs::create_dir_all(&tmp_dir).is_err() {
+        return;
+    }
+    let tmp_db = tmp_dir.join("places.sqlite");
+    for suffix in ["", "-wal", "-shm"] {
+        let s = profile_dir.join(format!("places.sqlite{suffix}"));
+        if s.is_file() {
+            let _ = std::fs::copy(&s, tmp_dir.join(format!("places.sqlite{suffix}")));
+        }
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        &tmp_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+    };
+    let query = "WITH RECURSIVE paths(id, path) AS (
+             SELECT b.id, CAST('' AS TEXT) FROM moz_bookmarks b WHERE b.parent = 0
+             UNION ALL
+             SELECT b.id,
+                    CASE WHEN pp.path = '' THEN COALESCE(b.title, '')
+                         ELSE pp.path || '/' || COALESCE(b.title, '') END
+             FROM moz_bookmarks b JOIN paths pp ON b.parent = pp.id
+         )
+         SELECT COALESCE(pp.path, ''), COALESCE(b.title, ''), p.url
+         FROM moz_bookmarks b
+         JOIN moz_places p ON b.fk = p.id
+         JOIN paths pp ON b.parent = pp.id
+         WHERE b.type = 1";
+    let Ok(mut stmt) = conn.prepare(query) else {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return;
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    });
+    if let Ok(rows) = rows {
+        for row in rows.flatten() {
+            let (path, name, url) = row;
+            let url = url.trim();
+            // 与 Chromium 口径一致：空网址 / javascript: 跳过；place: 是 Firefox 内部资源页
+            if url.is_empty() || url.starts_with("javascript:") || url.starts_with("place:") {
+                *skipped += 1;
+                continue;
+            }
+            // 根层为固定四项：menu/toolbar/unfiled/tags，映射为中文；tags 整树跳过
+            let (root, rest) = match path.split_once('/') {
+                Some((r, rest)) => (r, rest),
+                None => (path.as_str(), ""),
+            };
+            if root == "tags" {
+                *skipped += 1;
+                continue;
+            }
+            let root_name = match root {
+                "menu" => "书签菜单",
+                "toolbar" => "书签栏",
+                "unfiled" => "其他书签",
+                other => other,
+            };
+            // Firefox 允许空标题书签：退化为用网址当名称，不跳过
+            let name = name.trim();
+            let display = if name.is_empty() { url } else { name };
+            *counted += 1;
+            out.push(BrowserBookmark {
+                name: display.to_string(),
+                target: url.to_string(),
+                folder: if rest.is_empty() {
+                    root_name.to_string()
+                } else {
+                    format!("{root_name}/{rest}")
+                },
+                browser: browser.to_string(),
+            });
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 fn collect_bookmark_children(
