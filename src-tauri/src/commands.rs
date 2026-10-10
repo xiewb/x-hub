@@ -3805,7 +3805,13 @@ pub fn scan_browser_tabs() -> Result<BrowserTabScan, String> {
                 .collect();
             profile_dirs.sort(); // Default 优先（字典序）
             for pd in profile_dirs {
-                count += collect_chromium_tabs(pd.join("Sessions"), browser, &mut items);
+                count += collect_chromium_tabs(
+                    pd.join("Sessions"),
+                    Some(pd.join("Bookmarks")),
+                    Some(pd.join("Sync Data").join("LevelDB")),
+                    browser,
+                    &mut items,
+                );
             }
             if count > 0 {
                 browsers_done.push(browser.to_string());
@@ -3845,12 +3851,28 @@ pub fn scan_browser_tabs() -> Result<BrowserTabScan, String> {
 /// 返回标签数（0 = 无可读会话）。
 fn collect_chromium_tabs(
     sessions_dir: std::path::PathBuf,
+    bookmarks_file: Option<std::path::PathBuf>,
+    sync_dir: Option<std::path::PathBuf>,
     browser: &str,
     out: &mut Vec<BrowserTab>,
 ) -> usize {
     let Ok(dirs) = std::fs::read_dir(&sessions_dir) else {
         return 0;
     };
+    // 标签组成员外部来源（url → 组名）：保存的标签组同步库 + 书签「标签组」文件夹
+    let mut tab_group_bookmarks = sync_dir
+        .map(|d| extract_sync_tab_groups(&d))
+        .unwrap_or_default();
+    if let Some(p) = bookmarks_file {
+        if let Ok(m) = collect_tab_group_bookmarks(&p) {
+            for (u, g) in m {
+                if !tab_group_bookmarks.iter().any(|(x, _)| *x == u) {
+                    tab_group_bookmarks.push((u, g));
+                }
+            }
+        }
+        tab_group_bookmarks.sort_by_key(|(u, _)| std::cmp::Reverse(u.len()));
+    }
     let mut files: Vec<std::path::PathBuf> = dirs
         .flatten()
         .map(|e| e.path())
@@ -3863,26 +3885,273 @@ fn collect_chromium_tabs(
         })
         .collect();
     files.sort_by_key(|p| std::cmp::Reverse(p.metadata().and_then(|m| m.modified()).ok()));
+    // 组名与 tab→组归属跨全部可读文件累积（cmd27 组 GUID 与 cmd25 tab_id 全局可对齐），
+    // 标签页只取「修改时间最新的含导航记录的可读文件」（会话文件增量追加，跨文件 tab 不可比）
+    let mut tab_group: std::collections::HashMap<u32, [u8; 16]> =
+        std::collections::HashMap::new();
+    // 组名表键为 GUID 标准字符串形式（便于与 Tabbit group-home URL 中的 GUID 对齐）
+    let mut group_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut newest_nav: Option<Vec<(u32, String, String)>> = None;
     for f in files {
         let Ok(data) = std::fs::read(&f) else {
-            continue; // 浏览器运行中被独占锁定的最新快照：跳过，尝试次新文件
+            continue; // 浏览器运行中被独占锁定的最新快照：跳过
         };
-        if let Some(tabs) = parse_snss_tabs(&data, browser) {
-            if !tabs.is_empty() {
-                out.extend(tabs);
-                return out.len();
+        if let Some((nav, tg, gn)) = parse_snss_tabs(&data) {
+            for (g, name) in gn {
+                group_name.entry(guid_to_string(&g)).or_insert(name);
+            }
+            for (tid, g) in tg {
+                tab_group.entry(tid).or_insert(g);
+            }
+            if newest_nav.is_none() && !nav.is_empty() {
+                newest_nav = Some(nav);
             }
         }
     }
-    0
+    let Some(nav) = newest_nav else {
+        return 0;
+    };
+    let count = nav.len();
+    for (tid, url, title) in nav {
+        // 关联优先级：cmd25 归属映射 > Tabbit 组主页 URL 自带 GUID（group-home/<guid>）
+        let mut group = tab_group
+            .get(&tid)
+            .and_then(|g| group_name.get(&guid_to_string(g)).cloned())
+            .unwrap_or_default();
+        if group.is_empty() {
+            if let Some((_, rest)) = url.split_once("group-home/") {
+                let gs = rest
+                    .split(|c: char| !c.is_ascii_hexdigit() && c != '-')
+                    .next()
+                    .unwrap_or("");
+                if let Some(name) = group_name.get(gs) {
+                    group = name.clone();
+                }
+            }
+        }
+        // 兜底：Tabbit 会把保存的标签组同步进书签树（「标签组」文件夹下按组名分文件夹），
+        // 按规范化 URL 最长前缀反查组名（cmd25 归属记录常在锁定快照里读不到，且当前页
+        // 与保存时 URL 常有路径/锚点差异，精确匹配命中率过低）
+        if group.is_empty() {
+            let nu = normalize_url(&url);
+            if let Some((_, name)) = tab_group_bookmarks
+                .iter()
+                .find(|(bu, _)| {
+                    let (a, b) = if bu.len() <= nu.len() { (bu.as_str(), nu.as_str()) } else { (nu.as_str(), bu.as_str()) };
+                    b.starts_with(a)
+                        && (a.len() == b.len()
+                            || b.as_bytes()[a.len()] == b'/'
+                            || b.as_bytes()[a.len()] == b'?')
+                })
+            {
+                group = name.clone();
+            }
+        }
+        out.push(BrowserTab {
+            name: if title.trim().is_empty() {
+                url.clone()
+            } else {
+                title.trim().to_string()
+            },
+            target: url,
+            group,
+            browser: browser.to_string(),
+        });
+    }
+    count
 }
 
-/// 解析单个 SNSS 文件，重建「标签页 + 命名标签组」。
+/// URL 规范化：去 scheme、去锚点（#…）、去尾斜杠，供前缀匹配
+fn normalize_url(u: &str) -> String {
+    let u = u.split("#").next().unwrap_or(u);
+    let u = u.split("://").nth(1).unwrap_or(u);
+    let u = u.trim_end_matches('/');
+    u.to_string()
+}
+
+/// 从 Sync Data LevelDB 原始字节提取保存标签组映射（url → 组名）。
+/// Tabbit 等浏览器的「保存的标签组」成员关系存在同步库（SavedTabGroupSpecifics protobuf），
+/// 浏览器运行中该库可能独占锁定：逐文件读取、失败的跳过。不做 LevelDB 语义解析，
+/// 直接按二进制特征提取：组记录内 GUID 字符串 + UTF-8 组名（后随 color 字节 0x18,<0-9>）+
+/// URL；组名所在记录附近的 URL 归属该组。长前缀优先排序后返回。
+fn extract_sync_tab_groups(sync_dir: &std::path::Path) -> Vec<(String, String)> {
+    use std::collections::HashMap;
+    let Ok(dirs) = std::fs::read_dir(sync_dir) else {
+        return Vec::new();
+    };
+    let uuid_re = |data: &[u8], end: usize, back: usize| -> Option<String> {
+        // 在 data[end-back..end] 里找最后一个 uuid 字符串
+        let start = end.saturating_sub(back);
+        let seg = &data[start..end];
+        let mut best = None;
+        let mut i = 0;
+        while i + 36 <= seg.len() {
+            let s = &seg[i..i + 36];
+            if s.iter().enumerate().all(|(j, &b)| {
+                let c = b as char;
+                if [8, 13, 18, 23].contains(&j) {
+                    c == '-'
+                } else {
+                    c.is_ascii_hexdigit()
+                }
+            }) {
+                best = Some(String::from_utf8_lossy(s).to_string());
+            }
+            i += 1;
+        }
+        best
+    };
+    // 组 uuid → 名称（要求：UUID 字符串 + 之后 ≤60 字节处出现 UTF-8 CJK 名称，
+    // 名称后紧跟 protobuf color 字节 0x18 + 0..9，避免把页面标题误当组名）
+    let mut group_names: HashMap<String, String> = HashMap::new();
+    let mut files: Vec<std::path::PathBuf> = dirs.flatten().map(|e| e.path()).collect();
+    files.sort();
+    for f in &files {
+        let Ok(data) = std::fs::read(f) else { continue };
+        let mut i = 0;
+        while i + 3 < data.len() {
+            // UTF-8 CJK 起始（U+4E00–U+9FFF 常用区）
+            if data[i] >= 0xE4 && data[i] <= 0xE9 && data[i + 1] & 0xC0 == 0x80 {
+                // 尝试读一个 2~24 字的 CJK 串
+                let mut end = i;
+                let mut chars = 0;
+                while end + 2 < data.len() && chars < 24 {
+                    let b = data[end];
+                    if b >= 0xE4 && b <= 0xE9 && data[end + 1] & 0xC0 == 0x80 && data[end + 2] & 0xC0 == 0x80 {
+                        end += 3;
+                        chars += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if chars >= 2
+                    && end + 1 < data.len()
+                    && data[end] == 0x18
+                    && data[end + 1] <= 9
+                {
+                    if let Some(u) = uuid_re(&data, i, 120) {
+                        let name = String::from_utf8_lossy(&data[i..end]).to_string();
+                        group_names.entry(u).or_insert(name);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    if group_names.is_empty() {
+        return Vec::new();
+    }
+    // url → 组：URL 前近邻 uuid 是组 uuid → 归属；同 URL 多命中取先（长前缀由调用方排序）
+    let mut out: Vec<(String, String)> = Vec::new();
+    for f in &files {
+        let Ok(data) = std::fs::read(f) else { continue };
+        let mut i = 0;
+        while i + 8 < data.len() {
+            if &data[i..i + 4] == b"http" {
+                let mut end = i;
+                while end < data.len() && (data[end] > 0x20 && data[end] < 0x7f) && data[end] != b'"' {
+                    end += 1;
+                }
+                let url = String::from_utf8_lossy(&data[i..end]).trim().to_string();
+                if let Some(u) = uuid_re(&data, i, 100) {
+                    if let Some(name) = group_names.get(&u) {
+                        let nu = normalize_url(&url);
+                        if !nu.is_empty() && !out.iter().any(|(x, _)| *x == nu) {
+                            out.push((nu, name.clone()));
+                        }
+                    }
+                }
+                i = end;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    out.sort_by_key(|(u, _)| std::cmp::Reverse(u.len()));
+    out
+}
+
+/// 从书签文件提取「标签组」成员映射：遍历书签树，凡名为「标签组」的文件夹，
+/// 其下每个子文件夹视为一个保存的标签组，组内全部 URL → 子文件夹名。
+/// 返回 Err = 文件不存在或 JSON 解析失败。
+fn collect_tab_group_bookmarks(
+    path: &std::path::Path,
+) -> Result<Vec<(String, String)>, String> {
+    let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    let mut map: Vec<(String, String)> = Vec::new();
+    fn walk(node: &serde_json::Value, map: &mut Vec<(String, String)>) {
+        let Some(children) = node.get("children").and_then(|c| c.as_array()) else {
+            return;
+        };
+        let name = node.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        fn collect_urls(n: &serde_json::Value, map: &mut Vec<(String, String)>, group: &str) {
+            if n.get("type").and_then(|t| t.as_str()) == Some("url") {
+                if let Some(u) = n.get("url").and_then(|u| u.as_str()) {
+                    let nu = normalize_url(u.trim());
+                    if !nu.is_empty() && !map.iter().any(|(x, _)| *x == nu) {
+                        map.push((nu, group.to_string()));
+                    }
+                }
+                return;
+            }
+            if let Some(cs) = n.get("children").and_then(|c| c.as_array()) {
+                for c in cs {
+                    collect_urls(c, map, group);
+                }
+            }
+        }
+        for c in children {
+            let cname = c.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let is_folder = c.get("type").and_then(|t| t.as_str()) == Some("folder");
+            if name == "标签组" && is_folder {
+                // 该文件夹即一个保存的标签组：其下所有 URL 归入组名
+                collect_urls(c, map, cname);
+            } else {
+                walk(c, map);
+            }
+        }
+    }
+    if let Some(roots) = v.get("roots").and_then(|r| r.as_object()) {
+        for (_k, r) in roots {
+            if r.is_object() {
+                walk(r, &mut map);
+            }
+        }
+    }
+    // 长前缀优先：更具体的书签路径先命中
+    map.sort_by_key(|(u, _)| std::cmp::Reverse(u.len()));
+    Ok(map)
+}
+
+/// 16 字节二进制 GUID → 标准字符串形式（8-4-4-4-12，前三段小端序还原）
+fn guid_to_string(g: &[u8; 16]) -> String {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&g[0..4]),
+        hex(&g[4..6]),
+        hex(&g[6..8]),
+        hex(&g[8..10]),
+        hex(&g[10..16])
+    )
+}
+
+/// 解析单个 SNSS 文件，返回（标签页[(tab_id,url,title)], tab→组GUID, 组GUID→名称）。
 /// 记录帧：u16 size + u8 命令类型 + content（content 前 4 字节为 pickle payload_size）。
 /// cmd6 UpdateTabNavigation：tab_id u32、index u32、url str8、title str16（UTF-16LE）；
 /// cmd25 SetTabGroup：tab_id u32、占位 u32、组 GUID 16 字节；
 /// cmd27 SetTabGroupMetadata2：组 GUID 16 字节、名称字符数 u32、名称 UTF-16LE。
-fn parse_snss_tabs(data: &[u8], browser: &str) -> Option<Vec<BrowserTab>> {
+fn parse_snss_tabs(
+    data: &[u8],
+) -> Option<(
+    Vec<(u32, String, String)>,
+    Vec<(u32, [u8; 16])>,
+    Vec<([u8; 16], String)>,
+)> {
     if data.len() < 8 || &data[0..4] != b"SNSS" {
         return None;
     }
@@ -3959,30 +4228,13 @@ fn parse_snss_tabs(data: &[u8], browser: &str) -> Option<Vec<BrowserTab>> {
         }
         pos += 2 + size;
     }
-    if nav.is_empty() {
-        return None;
-    }
-    Some(
+    Some((
         nav.into_iter()
-            .map(|(tid, (_, url, title))| {
-                let group = tab_group
-                    .get(&tid)
-                    .and_then(|g| group_name.get(g))
-                    .cloned()
-                    .unwrap_or_default();
-                BrowserTab {
-                    name: if title.trim().is_empty() {
-                        url.clone()
-                    } else {
-                        title.trim().to_string()
-                    },
-                    target: url,
-                    group,
-                    browser: browser.to_string(),
-                }
-            })
+            .map(|(tid, (_, url, title))| (tid, url, title))
             .collect(),
-    )
+        tab_group.into_iter().collect(),
+        group_name.into_iter().collect(),
+    ))
 }
 
 /// pickle str8：u32 字节长 + UTF-8 + 4 字节对齐填充

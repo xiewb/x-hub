@@ -1064,3 +1064,48 @@ pub fn run() {
             }
         });
 }
+
+#[cfg(test)]
+mod sync_dbg {
+    use rusty_leveldb::LdbIterator;
+    #[test]
+    fn dbg_sync_leveldb() {
+        use rusty_leveldb::DB;
+        let Some(local) = dirs::data_local_dir() else { return };
+        let src = local.join(r"Tabbit Browser\User Data\Default\Sync Data\LevelDB");
+        let tmp = std::env::temp_dir().join("xhub_sync_dbg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for f in std::fs::read_dir(&src).unwrap().flatten() {
+            let p = f.path();
+            if p.is_file() {
+                if let Err(e) = std::fs::copy(&p, tmp.join(f.file_name())) {
+                    println!("copy 失败 {}: {}", f.file_name().to_string_lossy(), e);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(tmp.join("LOCK"));
+        println!("tmp={:?} 文件数={}", tmp, std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0));
+        let opts = rusty_leveldb::Options::default();
+        let mut db = DB::open(&tmp, opts).unwrap();
+        let mut n = 0; let mut hit = 0; let mut with_url = 0;
+        let kw: Vec<u8> = "综调开发".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut it = db.new_iter().unwrap();
+        while let Some((k, v)) = it.next() {
+            n += 1;
+            let has_url = v.windows(4).any(|w| w == b"http");
+            if has_url { with_url += 1; }
+            if v.windows(kw.len()).any(|w| w == kw) {
+                hit += 1;
+                if hit <= 2 {
+                    println!("KEY: {}", String::from_utf8_lossy(&k));
+                    println!("VAL({}): {}", v.len(), String::from_utf8_lossy(&v).replace(|c: char| !c.is_ascii() && !c.is_alphanumeric(), "."));
+                    println!("---");
+                }
+            }
+        }
+        println!("总键 {n}，含URL {with_url}，组名命中 {hit}");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = opts;
+    }
+}
