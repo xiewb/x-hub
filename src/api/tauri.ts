@@ -938,6 +938,20 @@ export interface BrowserBookmarkScan {
   truncated: number
 }
 
+/** 会话快照里的单个标签页（group 非空 = 属于某命名标签组） */
+export interface BrowserTab {
+  name: string
+  target: string
+  group: string
+  browser: string
+}
+
+/** 标签页扫描结果：note 解释会话快照口径（浏览器运行中最新快照被锁定） */
+export interface BrowserTabScan {
+  items: BrowserTab[]
+  note: string
+}
+
 export interface SystemInfo {
   cpuUsage: number
   memUsedMb: number
@@ -1245,6 +1259,8 @@ export const tauriApi = {
   /** 读取 Chromium 系浏览器书签（Chrome/Edge/Brave/Chromium），不读历史；dedupe=false 保留同一网址的重复条目 */
   scanBrowserBookmarks: (dedupe: boolean) =>
     invoke<BrowserBookmarkScan>('scan_browser_bookmarks', { dedupe }),
+  /** 扫描浏览器会话快照中的标签页与保存的标签组（Chromium 系 SNSS + Firefox jsonlz4） */
+  scanBrowserTabs: () => invoke<BrowserTabScan>('scan_browser_tabs'),
   /** 批量抓取网页图标（favicon）：返回 原样 target → 图标绝对路径（抓不到为 null）；同域名只抓一次 */
   fetchFavicons: (targets: string[]) =>
     invoke<Record<string, string | null>>('fetch_favicons', { targets }),

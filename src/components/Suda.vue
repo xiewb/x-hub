@@ -13,6 +13,7 @@ import {
   ListChecks,
   Loader2,
   MoreHorizontal,
+  PanelTop,
   Pencil,
   Plus,
   ScanSearch,
@@ -1208,6 +1209,15 @@ function cardAccentStyle(r: Resource) {
             @click="openScan('bookmarks')"
           >
             <Bookmark :size="15" :stroke-width="2.2" />
+          </button>
+          <button
+            v-if="isTauri()"
+            class="icon-btn scan"
+            title="导入浏览器标签页与标签组（会话快照）"
+            aria-label="导入浏览器标签页"
+            @click="openScan('tabs')"
+          >
+            <PanelTop :size="15" :stroke-width="2.2" />
           </button>
           <button
             class="icon-btn add"

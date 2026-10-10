@@ -886,6 +886,7 @@ pub fn run() {
             commands::scan_desktop,
             commands::delete_desktop_shortcuts,
             commands::scan_browser_bookmarks,
+            commands::scan_browser_tabs,
             commands::fetch_favicons,
             commands::get_running_processes,
             commands::list_tags,

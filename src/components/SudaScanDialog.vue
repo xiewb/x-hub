@@ -1,6 +1,6 @@
 <script lang="ts">
-/** 弹窗的三种扫描来源：已安装应用 / 桌面 / 浏览器书签 */
-export type ScanMode = 'apps' | 'desktop' | 'bookmarks'
+/** 弹窗的四种扫描来源：已安装应用 / 桌面 / 浏览器书签 / 浏览器标签页 */
+export type ScanMode = 'apps' | 'desktop' | 'bookmarks' | 'tabs'
 
 /** 统一的扫描结果项（folder 仅在桌面模式出现，导入时归入 file 大类） */
 export interface ScanItem {
@@ -53,6 +53,8 @@ const bookmarkMeta = ref<{
   skipped: number
   truncated: number
 } | null>(null)
+/** tabs 模式：后端返回的会话快照口径提示（浏览器运行中最新快照被锁定） */
+const tabNote = ref('')
 const checked = ref<Set<string>>(new Set())
 const keyword = ref('')
 const brokenIcons = ref<Set<string>>(new Set())
@@ -141,6 +143,16 @@ const CONF = {
     confirm: '加入速达',
     aria: '扫描桌面',
   },
+  tabs: {
+    title: '导入浏览器标签页',
+    sub: '读取各浏览器会话快照中打开的标签页与保存的标签组；浏览器运行中最新快照被锁定，读到的是上一次完整会话，关掉浏览器重扫即为当前',
+    placeholder: '搜索标签页…',
+    loading: '正在读取浏览器会话快照…',
+    loadingHint: '正在解析 Chromium SNSS / Firefox jsonlz4',
+    empty: '没有读取到浏览器标签页',
+    confirm: '导入选中',
+    aria: '导入浏览器标签页',
+  },
   bookmarks: {
     title: '导入浏览器书签',
     sub: '检测到的浏览器默认全部勾选，点浏览器行整组取消/恢复；展开目录可逐级挑选，也可搜索',
@@ -188,7 +200,7 @@ const groups = computed(() => {
       items: list.filter((a) => a.kind === k),
     })).filter((g) => g.items.length > 0)
   }
-  if (props.mode === 'bookmarks') {
+  if (props.mode === 'bookmarks' || props.mode === 'tabs') {
     const map = new Map<string, ScanItem[]>()
     for (const a of list) {
       const f = a.folder ?? '未分类'
@@ -404,7 +416,7 @@ type ListRow =
 
 const rows = computed<ListRow[]>(() => {
   // 书签 + 无搜索词：可折叠文件夹树（子文件夹在前、直挂书签在后，与浏览器书签管理器一致）
-  if (props.mode === 'bookmarks' && !keyword.value.trim()) {
+  if ((props.mode === 'bookmarks' || props.mode === 'tabs') && !keyword.value.trim()) {
     const out: ListRow[] = []
     const walk = (nodes: BookmarkNode[]) => {
       for (const n of nodes) {
@@ -421,7 +433,7 @@ const rows = computed<ListRow[]>(() => {
     return out
   }
   // 其余：扁平分组（应用/桌面模式 + 书签搜索结果，搜索时跨文件夹的命中平铺最好认）
-  const catPreview = props.mode === 'bookmarks' && groupByFolder.value
+  const catPreview = (props.mode === 'bookmarks' || props.mode === 'tabs') && groupByFolder.value
   return groups.value.flatMap((g) => {
     const head: ListRow[] = g.label
       ? [
@@ -468,7 +480,7 @@ const selectedShortcuts = computed(() =>
 
 /** 书签模式：勾选项按文件夹归类时，需要新建的速达小类数量（已存在的不计；含手动改名的覆盖） */
 const newCategoryCount = computed(() => {
-  if (props.mode !== 'bookmarks' || !groupByFolder.value) return 0
+  if ((props.mode !== 'bookmarks' && props.mode !== 'tabs') || !groupByFolder.value) return 0
   const existing = new Set(store.subcategoriesOf('web').map((s) => s.name))
   const wanted = new Set<string>()
   for (const a of items.value) {
@@ -496,6 +508,19 @@ async function runScan(mode: ScanMode): Promise<ScanItem[]> {
   if (mode === 'desktop') {
     const list = await tauriApi.scanDesktop()
     return list.map((d) => ({ ...d, kind: d.kind }))
+  }
+  if (mode === 'tabs') {
+    const scan = await tauriApi.scanBrowserTabs()
+    tabNote.value = scan.note
+    // folder = 标签组名（复用书签的分组树/小类机制；无组标签归「未分组」）
+    return scan.items.map((t) => ({
+      name: t.name,
+      target: t.target,
+      icon: null,
+      kind: 'web' as const,
+      folder: t.group || '未分组',
+      browser: t.browser,
+    }))
   }
   if (mode === 'bookmarks') {
     const scan = await tauriApi.scanBrowserBookmarks(dedupeBookmarks.value)
@@ -636,7 +661,13 @@ function confirm() {
   const withCategory = selected.map((a) => ({
     ...a,
     category:
-      props.mode === 'bookmarks' && groupByFolder.value ? effectiveCategory(a.folder) : null,
+      props.mode === 'tabs'
+        ? a.folder && a.folder !== '未分组'
+          ? a.folder
+          : null
+        : props.mode === 'bookmarks' && groupByFolder.value
+          ? effectiveCategory(a.folder)
+          : null,
   }))
   emit('imported', withCategory, props.mode === 'desktop' && cleanShortcuts.value)
   emit('close')
@@ -692,6 +723,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           </template>
 
           <!-- 书签模式：按浏览器文件夹设置速达小类（浏览器里已分好的目录直接沿用） -->
+          <template v-if="mode === 'tabs' && !loading && !error && tabNote">
+            <p class="scan-note">{{ tabNote }}</p>
+          </template>
+
+          <!-- 书签模式：按浏览器文件夹设置速达小类（浏览器里已分好的目录直接沿用） -->
           <template v-if="mode === 'bookmarks' && !loading && !error && items.length > 0">
             <label class="scan-clean">
               <input
@@ -728,7 +764,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 @keydown="onKeydown"
               />
             </div>
-            <template v-if="mode === 'bookmarks' && !keyword.trim()">
+            <template v-if="(mode === 'bookmarks' || mode === 'tabs') && !keyword.trim()">
               <button class="ghost-btn scan-select-all" @click="setExpandAll(false)">
                 收起全部
               </button>

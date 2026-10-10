@@ -3754,6 +3754,328 @@ pub async fn fetch_favicons(
     Ok(crate::favicon::fetch_favicons(targets).await)
 }
 
+// ---------- 扫描浏览器标签页 ----------
+
+/// 会话快照里的单个标签页。group 非空表示该 tab 属于某命名标签组。
+#[derive(serde::Serialize)]
+pub struct BrowserTab {
+    pub name: String,
+    pub target: String,
+    /// 标签组名（无组/未命名组为空串）
+    pub group: String,
+    pub browser: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct BrowserTabScan {
+    pub items: Vec<BrowserTab>,
+    /// 数据口径提示：SNSS/jsonlz4 是浏览器会话快照——浏览器运行中最新快照被独占锁定，
+    /// 只能读到上一次完整会话；关掉浏览器后重新扫描才是当前会话
+    pub note: String,
+}
+
+/// 扫描浏览器标签页与会话快照中的标签组。
+/// Chromium 系：解析 Users/<profile>/Sessions 下可读的最新 SNSS 文件
+/// （cmd6 标签导航、cmd25 tab→组GUID、cmd27 组GUID→组名）；
+/// Firefox：sessionstore-backups/recovery.jsonlz4（mozLZ4 压缩 JSON）。
+#[tauri::command]
+pub fn scan_browser_tabs() -> Result<BrowserTabScan, String> {
+    let mut items: Vec<BrowserTab> = Vec::new();
+    let mut browsers_done: Vec<String> = Vec::new();
+    if let Some(local) = dirs::data_local_dir() {
+        // 与书签扫描同一 vendor 名单：SNSS 格式 Chromium 系通用
+        let vendors: [(&str, &str); 5] = [
+            ("Chrome", r"Google\Chrome\User Data"),
+            ("Edge", r"Microsoft\Edge\User Data"),
+            ("Brave", r"BraveSoftware\Brave-Browser\User Data"),
+            ("Chromium", r"Chromium\User Data"),
+            ("Tabbit", r"Tabbit Browser\User Data"),
+        ];
+        for (browser, rel) in vendors {
+            let count = collect_chromium_tabs(local.join(rel).join("Sessions"), browser, &mut items);
+            if count > 0 {
+                browsers_done.push(browser.to_string());
+            }
+        }
+    }
+    if let Some(roaming) = dirs::data_dir() {
+        let ff_root = roaming.join(r"Mozilla\Firefox\Profiles");
+        if let Ok(dirs) = std::fs::read_dir(&ff_root) {
+            for profile in dirs.flatten() {
+                let path = profile.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if collect_firefox_tabs(&path, &mut items) {
+                    browsers_done.push("Firefox".to_string());
+                }
+            }
+        }
+    }
+    // 同浏览器同网址去重（同标签在多个快照文件重复出现），跨浏览器保留
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    items.retain(|t| seen.insert((t.browser.clone(), t.target.to_lowercase())));
+    log::info!(
+        "扫描浏览器标签页: {} 条，来源 {:?}",
+        items.len(),
+        browsers_done
+    );
+    Ok(BrowserTabScan {
+        note: "标签页来自浏览器会话快照：浏览器运行中最新快照被锁定，读到的是上一次完整会话；关闭浏览器后重新扫描即为当前会话".to_string(),
+        items,
+    })
+}
+
+/// 解析一个浏览器 profile 的 Sessions 目录：对每个可读 SNSS 文件独立重建标签集，
+/// 取修改时间最新的非空结果（会话文件是增量追加，跨文件 tab_id 不可比，不能合并）。
+/// 返回标签数（0 = 无可读会话）。
+fn collect_chromium_tabs(
+    sessions_dir: std::path::PathBuf,
+    browser: &str,
+    out: &mut Vec<BrowserTab>,
+) -> usize {
+    let Ok(dirs) = std::fs::read_dir(&sessions_dir) else {
+        return 0;
+    };
+    let mut files: Vec<std::path::PathBuf> = dirs
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("Session_") || n.starts_with("Tabs_"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    files.sort_by_key(|p| std::cmp::Reverse(p.metadata().and_then(|m| m.modified()).ok()));
+    for f in files {
+        let Ok(data) = std::fs::read(&f) else {
+            continue; // 浏览器运行中被独占锁定的最新快照：跳过，尝试次新文件
+        };
+        if let Some(tabs) = parse_snss_tabs(&data, browser) {
+            if !tabs.is_empty() {
+                out.extend(tabs);
+                return out.len();
+            }
+        }
+    }
+    0
+}
+
+/// 解析单个 SNSS 文件，重建「标签页 + 命名标签组」。
+/// 记录帧：u16 size + u8 命令类型 + content（content 前 4 字节为 pickle payload_size）。
+/// cmd6 UpdateTabNavigation：tab_id u32、index u32、url str8、title str16（UTF-16LE）；
+/// cmd25 SetTabGroup：tab_id u32、占位 u32、组 GUID 16 字节；
+/// cmd27 SetTabGroupMetadata2：组 GUID 16 字节、名称字符数 u32、名称 UTF-16LE。
+fn parse_snss_tabs(data: &[u8], browser: &str) -> Option<Vec<BrowserTab>> {
+    if data.len() < 8 || &data[0..4] != b"SNSS" {
+        return None;
+    }
+    let mut nav: std::collections::HashMap<u32, (u32, String, String)> =
+        std::collections::HashMap::new();
+    let mut tab_group: std::collections::HashMap<u32, [u8; 16]> =
+        std::collections::HashMap::new();
+    let mut group_name: std::collections::HashMap<[u8; 16], String> =
+        std::collections::HashMap::new();
+    let mut pos = 8usize;
+    while pos + 3 <= data.len() {
+        let size = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        if size == 0 || pos + 2 + size > data.len() {
+            break;
+        }
+        let cmd = data[pos + 2];
+        let content = &data[pos + 3..pos + 2 + size];
+        if content.len() >= 8 {
+            let p = &content[4..]; // 跳过 pickle payload_size
+            match cmd {
+                6 => {
+                    if p.len() > 8 {
+                        let tid = u32::from_le_bytes(p[0..4].try_into().ok()?);
+                        let idx = u32::from_le_bytes(p[4..8].try_into().ok()?);
+                        let mut o = 8usize;
+                        if let Some((url, o2)) = read_str8(p, o) {
+                            o = o2;
+                            if let Some((title, _)) = read_str16(p, o) {
+                                let better = nav
+                                    .get(&tid)
+                                    .map_or(true, |(pi, _, _)| idx >= *pi);
+                                if better && !url.is_empty() && !url.starts_with("javascript:")
+                                {
+                                    nav.insert(tid, (idx, url, title));
+                                }
+                            }
+                        }
+                    }
+                }
+                25 => {
+                    if p.len() >= 24 {
+                        let tid = u32::from_le_bytes(p[0..4].try_into().ok()?);
+                        let mut guid = [0u8; 16];
+                        guid.copy_from_slice(&p[8..24]);
+                        if guid.iter().any(|&b| b != 0) {
+                            tab_group.insert(tid, guid);
+                        }
+                    }
+                }
+                27 => {
+                    if p.len() >= 20 {
+                        let mut guid = [0u8; 16];
+                        guid.copy_from_slice(&p[0..16]);
+                        let nchars =
+                            u32::from_le_bytes(p[16..20].try_into().ok()?) as usize;
+                        if nchars > 0 && nchars < 128 {
+                            let nb = nchars * 2;
+                            if p.len() >= 20 + nb {
+                                let name = String::from_utf16_lossy(
+                                    &p[20..20 + nb]
+                                        .chunks_exact(2)
+                                        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+                                        .collect::<Vec<u16>>(),
+                                );
+                                if !name.trim().is_empty() {
+                                    group_name.insert(guid, name.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        pos += 2 + size;
+    }
+    if nav.is_empty() {
+        return None;
+    }
+    Some(
+        nav.into_iter()
+            .map(|(tid, (_, url, title))| {
+                let group = tab_group
+                    .get(&tid)
+                    .and_then(|g| group_name.get(g))
+                    .cloned()
+                    .unwrap_or_default();
+                BrowserTab {
+                    name: if title.trim().is_empty() {
+                        url.clone()
+                    } else {
+                        title.trim().to_string()
+                    },
+                    target: url,
+                    group,
+                    browser: browser.to_string(),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// pickle str8：u32 字节长 + UTF-8 + 4 字节对齐填充
+fn read_str8(p: &[u8], mut o: usize) -> Option<(String, usize)> {
+    if o + 4 > p.len() {
+        return None;
+    }
+    let n = u32::from_le_bytes(p[o..o + 4].try_into().ok()?) as usize;
+    o += 4;
+    if o + n > p.len() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&p[o..o + n]).to_string();
+    o += n + (4 - n % 4) % 4;
+    Some((s, o))
+}
+
+/// pickle str16：u32 字符数 + UTF-16LE + 4 字节对齐填充
+fn read_str16(p: &[u8], mut o: usize) -> Option<(String, usize)> {
+    if o + 4 > p.len() {
+        return None;
+    }
+    let nchars = u32::from_le_bytes(p[o..o + 4].try_into().ok()?) as usize;
+    o += 4;
+    let nb = nchars * 2;
+    if o + nb > p.len() {
+        return None;
+    }
+    let units: Vec<u16> = p[o..o + nb]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    o += nb + (4 - nb % 4) % 4;
+    Some((String::from_utf16_lossy(&units), o))
+}
+
+/// Firefox：读 profile/sessionstore-backups 下最新的 *.jsonlz4（mozLZ4：8 字节头 + u32 解压后大小 + LZ4 block）。
+/// recovery.jsonlz4 是当前会话恢复快照（Firefox 运行中也可读）；返回是否取到标签。
+fn collect_firefox_tabs(profile_dir: &std::path::Path, out: &mut Vec<BrowserTab>) -> bool {
+    let bkp = profile_dir.join("sessionstore-backups");
+    let mut candidates = ["recovery.jsonlz4", "previous.jsonlz4", "recovery.baklz4"]
+        .iter()
+        .map(|n| bkp.join(n))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|p| std::cmp::Reverse(p.metadata().and_then(|m| m.modified()).ok()));
+    for f in candidates {
+        let Ok(data) = std::fs::read(&f) else {
+            continue;
+        };
+        if data.len() < 12 || &data[0..8] != b"mozLz40\0\0" {
+            continue;
+        }
+        let size = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let Ok(json_bytes) = lz4_flex::block::decompress(&data[12..], size) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&json_bytes) else {
+            continue;
+        };
+        let mut found = false;
+        if let Some(windows) = v.get("windows").and_then(|w| w.as_object()) {
+            for (_wid, w) in windows {
+                let Some(tabs) = w.get("tabs").and_then(|t| t.as_array()) else {
+                    continue;
+                };
+                for t in tabs {
+                    let idx = t.get("index").and_then(|i| i.as_u64()).unwrap_or(1) as usize;
+                    let Some(entries) = t.get("entries").and_then(|e| e.as_array()) else {
+                        continue;
+                    };
+                    let Some(entry) = entries.get(idx.saturating_sub(1)) else {
+                        continue;
+                    };
+                    let url = entry
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if url.is_empty() || url.starts_with("javascript:") {
+                        continue;
+                    }
+                    let title = entry
+                        .get("title")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    found = true;
+                    out.push(BrowserTab {
+                        name: if title.is_empty() {
+                            url.to_string()
+                        } else {
+                            title.to_string()
+                        },
+                        target: url.to_string(),
+                        group: String::new(), // Firefox 原生无标签组
+                        browser: "Firefox".to_string(),
+                    });
+                }
+            }
+        }
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 // ---------- 运行状态检测 ----------
 
 /// 返回当前所有正在运行的进程名（ImageName，小写去重、排序）。
