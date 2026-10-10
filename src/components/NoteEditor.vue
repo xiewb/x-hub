@@ -127,6 +127,8 @@ let detachImageListeners: () => void = () => {}
  * destroyEditor 触达，后置声明 = ReferenceError: Cannot access ... before initialization，实测踩过） */
 let detachWikiListeners: () => void = () => {}
 const wikiSuggest = ref<WikiSuggest | null>(null)
+/** [[ 补全浮层的 <ul>（Teleport 到 body）；键盘上下键时用它把选中项滚进可视区 */
+const wikiListEl = ref<HTMLUListElement | null>(null)
 
 interface WikiSuggest {
   /** 「[[」起点（文档位置） */
@@ -136,6 +138,8 @@ interface WikiSuggest {
   index: number
   x: number
   y: number
+  /** 下方空间不足时翻到光标上方显示（避免贴窗口底被截断） */
+  openUp: boolean
 }
 
 const localTitle = ref('')
@@ -578,9 +582,19 @@ watch([splitSourceEl, previewEl], () => {
  * 捕获阶段接住回车，把整行快捷标记换成代码块、公式块、图片块、表格、标题、引用、列表或分隔线。
  */
 function onCrepeKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || !crepe) return
+  if (e.isComposing || !crepe) return
   const target = e.target
   if (target instanceof HTMLElement && target.closest('input, textarea, .milkdown-slash-menu')) return
+  // 智能括号：「[」自动补「]」、「]」跳过已补的右括号。程序化 dispatch 不触发原生
+  // input，故在此接住按键自行改文档（IME 组合中的按键已在上面放行）
+  if (e.key === '[' || e.key === ']') {
+    if (handleBracketKey(e.key)) {
+      e.preventDefault()
+      e.stopPropagation()
+    }
+    return
+  }
+  if (e.key !== 'Enter' || e.shiftKey) return
   let handled = false
   crepe.editor.action((ctx) => {
     const view = ctx.get(editorViewCtx)
@@ -693,6 +707,92 @@ function onCrepeKeydown(e: KeyboardEvent) {
   if (!handled) return
   e.preventDefault()
   e.stopPropagation()
+}
+
+/**
+ * 智能括号（仅实时预览）：输入「[」自动补「]」并把光标落在中间；再输入一个「[」即成「[[」，
+ * 手动刷新 [[ 标题补全浮层（程序化 dispatch 不触发原生 input）。输入「]」时若光标右侧已是补出
+ * 的「]」则跳过，不重复插入。返回是否已接管该按键（接管时调用方需 preventDefault）。
+ */
+function handleBracketKey(key: string): boolean {
+  const c = crepe
+  if (!c || mode.value !== 'wysiwyg') return false
+  let handled = false
+  c.editor.action((ctx) => {
+    const view = ctx.get(editorViewCtx)
+    const { state } = view
+    if (!state.selection.empty) return
+    const { $from } = state.selection
+    if ($from.depth === 0 || !$from.parent.inlineContent || $from.parent.type.spec.code) return
+    const from = state.selection.from
+    const nextChar = state.doc.textBetween(from, Math.min(from + 1, state.doc.content.size), '', '\uFFFC')
+    if (key === ']') {
+      // 光标右侧就是自动补出的右括号 → 跳过它，不重复插入
+      if (nextChar !== ']') return
+      view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, from + 1)))
+      handled = true
+      return
+    }
+    // key === '['：插入一对括号并把光标落到中间
+    const tr = state.tr.insertText('[]', from, from)
+    tr.setSelection(TextSelection.create(tr.doc, from + 1))
+    view.dispatch(tr)
+    handled = true
+    // 延一拍等 ProseMirror 完成 DOM 更新，再按新光标刷新 [[ 补全浮层
+    setTimeout(() => {
+      const cc = crepe
+      if (!cc) return
+      cc.editor.action((ctx2) => refreshWikiSuggest(ctx2.get(editorViewCtx)))
+    }, 0)
+  })
+  return handled
+}
+
+/**
+ * 智能括号的输入兜底（覆盖中文输入法）：handleBracketKey 走的是 keydown，但中文输入法把
+ * 「[」当组合文本提交时 keydown 的 isComposing 为真会被跳过——字符照样落进文档，只是没补
+ * 「]」。这里在 input/compositionend 之后按实际提交的字符补偿，与 keydown 路径互斥（后者已
+ * preventDefault，不会触发原生 input）。lastBracketFix 用于吸收 input 与 compositionend
+ * 对同一次提交的重复回调。
+ */
+let lastBracketFix: { pos: number; text: string } | null = null
+function syncBracketFromInput(data: string) {
+  const last = data.endsWith('[') ? '[' : data.endsWith(']') ? ']' : ''
+  if (!last) {
+    lastBracketFix = null
+    return
+  }
+  const c = crepe
+  if (!c || mode.value !== 'wysiwyg') return
+  c.editor.action((ctx) => {
+    const view = ctx.get(editorViewCtx)
+    const { state } = view
+    if (!state.selection.empty) return
+    const { $from } = state.selection
+    if ($from.depth === 0 || !$from.parent.inlineContent || $from.parent.type.spec.code) return
+    const from = state.selection.from
+    const end = state.doc.content.size
+    const before = state.doc.textBetween(Math.max(0, from - 1), from, '', '\uFFFC')
+    const after = state.doc.textBetween(from, Math.min(from + 1, end), '', '\uFFFC')
+    if (last === '[') {
+      const text = $from.parent.textContent
+      if (lastBracketFix && lastBracketFix.pos === from && lastBracketFix.text === text) {
+        lastBracketFix = null
+        return
+      }
+      const next = state.tr.insertText(']', from, from)
+      next.setSelection(TextSelection.create(next.doc, from))
+      view.dispatch(next)
+      lastBracketFix = { pos: from, text: next.doc.resolve(from).parent.textContent }
+      return
+    }
+    // 右侧已是自动补出的「]」：删掉刚输入的「]」并把光标移到自动括号之后
+    if (before === ']' && after === ']') {
+      const del = state.tr.delete(from - 1, from)
+      del.setSelection(TextSelection.create(del.doc, from))
+      view.dispatch(del)
+    }
+  })
 }
 
 function shortcutNode(ctx: Ctx, schema: Schema, shortcut: LineShortcut): ProseNode | null {
@@ -972,7 +1072,9 @@ function onPreviewClick(e: MouseEvent) {
   if (anchor) {
     e.preventDefault()
     const href = anchor.getAttribute('href') ?? ''
-    if (/^https?:\/\//i.test(href)) void tauriApi.openExternal(href)
+    const noteId = noteIdFromHref(href)
+    if (noteId != null) emit('open-note', noteId)
+    else if (/^https?:\/\//i.test(href)) void tauriApi.openExternal(href)
     return
   }
   if (!(target instanceof HTMLImageElement) || !target.src) return
@@ -1160,7 +1262,10 @@ function onEditorClick(e: MouseEvent) {
     e.preventDefault()
     e.stopPropagation()
     const href = anchor.getAttribute('href') ?? ''
-    if (/^https?:\/\//i.test(href)) void tauriApi.openExternal(href)
+    const noteId = noteIdFromHref(href)
+    // 笔记引用链接 note/<id>：打开对应笔记（双链跳转）
+    if (noteId != null) emit('open-note', noteId)
+    else if (/^https?:\/\//i.test(href)) void tauriApi.openExternal(href)
     return
   }
   // [[标题]] 点击跳转（双链轻量版）：命中未解析/无同名笔记时按普通文本处理
@@ -1722,10 +1827,9 @@ watch(
 function candidateNotes(query: string): Note[] {
   const q = query.trim().toLowerCase()
   return store.state.notes
-    .filter((n) => n.id !== props.note?.id && n.title !== '无标题笔记')
+    .filter((n) => n.id !== props.note?.id)
     .filter((n) => (q ? n.title.toLowerCase().includes(q) : true))
     .sort((a, b) => a.title.localeCompare(b.title, 'zh'))
-    .slice(0, 8)
 }
 
 /** 光标前同一文本块内的「[[query」：返回引用起点，无则 null（口径同 slashQueryStart） */
@@ -1745,33 +1849,46 @@ function onWikiInput(e: Event) {
   // IME 组合期间绝不 dispatch（会炸掉组合、吞掉用户输入的字符）；组合结束后
   // 浏览器会再派发一次 isComposing=false 的 input，fix 在那时正常执行
   if ((e as InputEvent).isComposing) return
+  const data = (e as InputEvent).data ?? ''
   // ⚠️ 必须 setTimeout 延一拍：PM 对 DOM 变更的回读（DOMObserver）是异步 flush 的，
   // input 事件此刻的 state 还不含刚输入的字符，立即跑 fix 会读到旧文档而错过匹配
   // （实测：execCommand 输 / 后段落仍是占位符+/，fix 空跑）
   setTimeout(fixSlashAfterNbsp, 0)
-  c.editor.action((ctx) => {
-    const view = ctx.get(editorViewCtx)
-    const { state } = view
-    const found = wikiQueryStart(state, state.selection.from)
-    if (!found) {
-      wikiSuggest.value = null
-      return
-    }
-    const items = candidateNotes(found.query)
-    if (items.length === 0) {
-      wikiSuggest.value = null
-      return
-    }
-    const coords = view.coordsAtPos(state.selection.from)
-    wikiSuggest.value = {
-      from: found.start,
-      query: found.query,
-      items,
-      index: 0,
-      x: coords.left,
-      y: coords.bottom,
-    }
-  })
+  // 智能括号的 IME 补偿：中文输入法把「[」作为组合文本提交时，keydown 的 isComposing
+  // 为真、handleBracketKey 被跳过（字符仍会正常落进文档），这里在字符落地后补上「]」
+  setTimeout(() => syncBracketFromInput(data), 0)
+  c.editor.action((ctx) => refreshWikiSuggest(ctx.get(editorViewCtx)))
+}
+
+/**
+ * 依当前光标位置刷新 [[ 标题补全浮层（无匹配则关闭）。
+ * 浮层最高 240px + 间距：光标下方放不下时翻到上方（openUp），避免贴窗口底被截断。
+ * 除原生 input 事件外，「输入第二个 [ 自动配对」是程序化 dispatch（不触发原生 input），
+ * 也需显式调用本函数。
+ */
+function refreshWikiSuggest(view: EditorView) {
+  const found = wikiQueryStart(view.state, view.state.selection.from)
+  if (!found) {
+    wikiSuggest.value = null
+    return
+  }
+  const items = candidateNotes(found.query)
+  if (items.length === 0) {
+    wikiSuggest.value = null
+    return
+  }
+  const coords = view.coordsAtPos(view.state.selection.from)
+  const BELOW_NEED = 260
+  const openUp = window.innerHeight - coords.bottom < BELOW_NEED
+  wikiSuggest.value = {
+    from: found.start,
+    query: found.query,
+    items,
+    index: 0,
+    x: Math.max(8, Math.min(coords.left, window.innerWidth - 200)),
+    y: openUp ? coords.top - 6 : coords.bottom,
+    openUp,
+  }
 }
 
 /**
@@ -1817,10 +1934,12 @@ function onWikiKeydown(e: KeyboardEvent) {
     e.preventDefault()
     e.stopPropagation()
     s.index = (s.index + 1) % s.items.length
+    scrollWikiIntoView()
   } else if (e.key === 'ArrowUp') {
     e.preventDefault()
     e.stopPropagation()
     s.index = (s.index - 1 + s.items.length) % s.items.length
+    scrollWikiIntoView()
   } else if (e.key === 'Enter' || e.key === 'Tab') {
     e.preventDefault()
     e.stopPropagation()
@@ -1832,6 +1951,20 @@ function onWikiKeydown(e: KeyboardEvent) {
   }
 }
 
+/** 键盘上下切换选中项后，把该项滚进浮层可视区（列表超出 max-height 时）。
+ * 不用 scrollIntoView：它可能连带滚动页面；这里只调浮层自身的 scrollTop。 */
+function scrollWikiIntoView() {
+  const el = wikiListEl.value
+  const s = wikiSuggest.value
+  if (!el || !s) return
+  const active = el.children[s.index] as HTMLElement | undefined
+  if (!active) return
+  const top = active.offsetTop
+  const bottom = top + active.offsetHeight
+  if (top < el.scrollTop) el.scrollTop = top
+  else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight
+}
+
 function commitWikiSuggest(item: Note) {
   const s = wikiSuggest.value
   const c = crepe
@@ -1839,14 +1972,127 @@ function commitWikiSuggest(item: Note) {
   if (!s || !c) return
   c.editor.action((ctx) => {
     const view = ctx.get(editorViewCtx)
-    const to = view.state.selection.from
-    view.dispatch(view.state.tr.insertText(`[[${item.title}]]`, s.from, to))
+    const { state } = view
+    const end = state.doc.content.size
+    // 自动补出的右括号在此一并替换：光标后紧跟 "]]" 时连它一起换掉，避免残留多余的 ]
+    const after = state.doc.textBetween(state.selection.from, Math.min(state.selection.from + 2, end), '', '\uFFFC')
+    const to = state.selection.from + (after === ']]' ? 2 : 0)
+    // 引用改写成「链接类型」：正文只留标题（去掉 [[]]），套 link mark 指向 note/<id>，
+    // 渲染为下划线 + 品牌色的可点链接；双链索引按 note/<id> 解析。
+    const text = item.title
+    let tr = state.tr.insertText(text, s.from, to)
+    const linkType = state.schema.marks.link
+    if (linkType) {
+      tr = tr.addMark(s.from, s.from + text.length, linkType.create({ href: noteHref(item.id) }))
+      tr = tr.removeStoredMark(linkType)
+    }
+    view.dispatch(tr)
     view.focus()
   })
 }
 
+/** 笔记引用链接的目标形式：相对 URL `note/<id>`（无 scheme，避开 Milkdown 的链接协议白名单过滤） */
+const NOTE_HREF_PREFIX = 'note/'
+function noteHref(id: number): string {
+  return `${NOTE_HREF_PREFIX}${id}`
+}
+function noteIdFromHref(href: string): number | null {
+  if (!href.startsWith(NOTE_HREF_PREFIX)) return null
+  const id = Number(href.slice(NOTE_HREF_PREFIX.length))
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+/** 笔记 id → 笔记、文件夹 id → 文件夹 的常驻索引：[[ 补全列表渲染全部笔记，模板里每项
+ *  都要查一次路径，逐项 find/新建 Map 是 O(条目×(笔记数+文件夹数))，大库下每次按键都卡 */
+const notesById = computed(() => new Map(store.state.notes.map((n) => [n.id, n])))
+const foldersById = computed(() => new Map(store.state.noteFolders.map((f) => [f.id, f])))
+
+/** 笔记所在的目录路径（文件夹逐级 name，用「 / 」连接；根目录返回空串）。
+ * 用于 [[ 补全列表右侧标注、链接气泡与复制按钮（需求：走 name，不暴露 note/<id>） */
+function noteFolderPath(id: number): string {
+  const note = notesById.value.get(id)
+  if (!note) return ''
+  const names: string[] = []
+  const seen = new Set<number>()
+  let fid = note.folder_id
+  while (fid != null) {
+    const f = foldersById.value.get(fid)
+    if (!f || seen.has(fid)) break
+    seen.add(fid)
+    names.unshift(f.name)
+    fid = f.parent_id
+  }
+  return names.join(' / ')
+}
+
+/** 笔记在目录树里的完整路径（文件夹逐级 + 标题），用于链接气泡显示目标位置而非裸 id */
+function noteTreePath(id: number): string {
+  const note = notesById.value.get(id)
+  if (!note) return `已删除的笔记（${id}）`
+  const dir = noteFolderPath(id)
+  const title = note.title.trim() || '无标题笔记'
+  return dir ? `${dir} / ${title}` : title
+}
+
+/**
+ * 链接气泡里显示的地址默认是 href（`note/<id>`）。这里把它换成目录树里的实际路径。
+ * Crepe 用 Vue 渲染气泡，text 变化会改写同一个文本节点；观察该节点并原地改 nodeValue
+ * （不动节点本身，Vue 后续仍能正常 patch），只在值不同时写，避免观察者自触发死循环。
+ */
+function syncLinkPreviewPath() {
+  const root = rootEl.value
+  if (!root) return
+  const display = root.querySelector<HTMLAnchorElement>('.milkdown-link-preview .link-display')
+  if (!display) return
+  const href = display.getAttribute('href') ?? ''
+  const id = noteIdFromHref(href)
+  // 笔记引用链接隐藏「编辑」按钮（手改 href 会把双链指向改坏）；外链保留编辑能力
+  display.closest('.milkdown-link-preview')?.classList.toggle('xh-note-link', id != null)
+  if (id == null) return
+  const path = noteTreePath(id)
+  const node = display.firstChild
+  if (node && node.nodeType === Node.TEXT_NODE) {
+    if (node.nodeValue !== path) node.nodeValue = path
+  } else if (!node) {
+    display.textContent = path
+  }
+}
+
 function onWikiClickItem(item: Note) {
   commitWikiSuggest(item)
+}
+
+/**
+ * 链接气泡左侧的「复制」图标默认复制 href（`note/<id>`）。捕获阶段先于 Crepe 自身的
+ * onClick 接住，对笔记链接改写为目录树完整路径（走 name）；非笔记链接不拦截，交回原生复制。
+ */
+function onEditorCaptureClick(e: MouseEvent) {
+  const target = e.target
+  if (!(target instanceof Element)) return
+  // 笔记链接的「编辑」按钮直接拦下（即使样式被覆盖仍可见也不响应）：手改 href 会破坏双链
+  const editBtn = target.closest('.milkdown-link-preview .link-edit-button')
+  if (editBtn) {
+    const href =
+      editBtn.closest('.milkdown-link-preview')?.querySelector('.link-display')?.getAttribute('href') ?? ''
+    if (noteIdFromHref(href) != null) {
+      e.preventDefault()
+      e.stopPropagation()
+    }
+    return
+  }
+  const copyBtn = target.closest('.milkdown-link-preview .link-icon')
+  if (!copyBtn) return
+  const display = copyBtn.closest('.milkdown-link-preview')?.querySelector('.link-display')
+  const href = display?.getAttribute('href') ?? ''
+  const id = noteIdFromHref(href)
+  if (id == null) return
+  e.preventDefault()
+  e.stopPropagation()
+  const path = noteTreePath(id)
+  navigator.clipboard?.writeText(path).then(
+    () => showToast?.('已复制笔记路径'),
+    () => showToast?.('复制失败'),
+  )
 }
 
 /** 点击位置落在 [[标题]] 内时返回该标题（同一文本块内扫描，索引 1:1 对应） */
@@ -1868,6 +2114,8 @@ function wikiTitleAt(state: EditorState, pos: number): string | null {
   return inner.trim()
 }
 
+let linkPreviewObserver: MutationObserver | null = null
+
 function attachWikiListeners() {
   const root = rootEl.value
   if (!root) return
@@ -1877,6 +2125,12 @@ function attachWikiListeners() {
   root.addEventListener('input', onWikiInput)
   root.addEventListener('compositionend', onWikiInput)
   root.addEventListener('keydown', onWikiKeydown, true)
+  // 链接气泡「复制」按钮改写（见 onEditorCaptureClick）：捕获阶段先于 Crepe 自身 onClick
+  root.addEventListener('click', onEditorCaptureClick, true)
+  // 链接气泡的地址显示改成目录树路径（见 syncLinkPreviewPath）；气泡元素由 Crepe 懒建，
+  // 用 MutationObserver 观察编辑区子树，出现/更新时改写文本
+  linkPreviewObserver = new MutationObserver(() => syncLinkPreviewPath())
+  linkPreviewObserver.observe(root, { subtree: true, childList: true, characterData: true })
   // 光标进入占位行时静默清掉占位符（prunePlaceholderAtCursor）：让「/」走 Crepe 原生
   // 触发路径——占位行被清空后输 / 不再需要 fix 的重建事务，那会与菜单项执行时内部
   // 记录的位置错位（点「一级标题」出现 // 段落、光标跳到下一段，实测）。selectionchange
@@ -1886,7 +2140,10 @@ function attachWikiListeners() {
     root.removeEventListener('input', onWikiInput)
     root.removeEventListener('compositionend', onWikiInput)
     root.removeEventListener('keydown', onWikiKeydown, true)
+    root.removeEventListener('click', onEditorCaptureClick, true)
     document.removeEventListener('selectionchange', prunePlaceholderAtCursor)
+    linkPreviewObserver?.disconnect()
+    linkPreviewObserver = null
     detachWikiListeners = () => {}
   }
 }
@@ -2292,7 +2549,7 @@ function onEditorAreaMouseDown(e: MouseEvent) {
           </header>
           <div class="elp-body">
             <p v-if="links.incoming.length === 0 && links.outgoing.length === 0" class="elp-empty">
-              正文输入 [[ 可引用其它笔记（按标题），这里会显示互相引用
+              正文输入 [[ 可引用其它笔记（插入为链接），这里会显示互相引用
             </p>
             <template v-else>
               <section v-if="links.incoming.length" class="elp-group">
@@ -2426,7 +2683,9 @@ function onEditorAreaMouseDown(e: MouseEvent) {
     <Teleport to="body">
       <ul
         v-if="wikiSuggest"
+        ref="wikiListEl"
         class="wiki-suggest"
+        :class="{ 'open-up': wikiSuggest.openUp }"
         :style="{ left: `${wikiSuggest.x}px`, top: `${wikiSuggest.y}px` }"
         role="listbox"
         aria-label="笔记标题补全"
@@ -2440,7 +2699,10 @@ function onEditorAreaMouseDown(e: MouseEvent) {
           @mousedown.prevent="onWikiClickItem(item)"
           @mouseenter="wikiSuggest && (wikiSuggest.index = i)"
         >
-          {{ item.title }}
+          <span class="wiki-suggest-title" :title="item.title">{{ item.title }}</span>
+          <span class="wiki-suggest-dir" :title="noteFolderPath(item.id) || '根目录'">
+            {{ noteFolderPath(item.id) || '根目录' }}
+          </span>
         </li>
       </ul>
     </Teleport>
@@ -2653,18 +2915,41 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   backdrop-filter: blur(10px);
 }
 .wiki-suggest li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 6px 10px;
   border-radius: var(--radius-sm);
   font-size: 0.75em;
   color: var(--text-1);
   cursor: pointer;
   overflow: hidden;
+}
+.wiki-suggest-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 右侧标注笔记所在目录（走 name，不显示 note/<id>）；根目录显示「根目录」 */
+.wiki-suggest-dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-4);
+  font-size: 0.9em;
 }
 .wiki-suggest li.on {
   background: var(--brand-50);
   color: var(--brand-500);
+}
+/* 下方空间不足时翻到光标上方：以光标上沿为基准向上偏移整层高度 */
+.wiki-suggest.open-up {
+  transform: translateY(-100%);
 }
 
 .del:hover {
@@ -2729,6 +3014,34 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   min-width: 0;
   overflow-x: hidden;
   overflow-y: auto;
+}
+
+/* 斜杠菜单隐藏态用 visibility 隐藏而非 display:none：Crepe 定位用的 floating-ui
+   flip() 在菜单 display:none 时量到 0 高度 → 判定“放得下”而从不翻转，编辑框贴近
+   窗口底部时菜单就贴着下方被截断。保持元素可测量，flip 才能在下方不足时翻到光标上方。 */
+.crepe-root :deep(.milkdown-slash-menu[data-show='false']) {
+  display: block;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* 正文链接（含 [[ 引用插入的笔记链接 note/<id>）统一走品牌色 + 下划线 + 手型光标 */
+.crepe-root :deep(.milkdown a) {
+  color: var(--brand-500);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+/* 悬停链接弹出的气泡里那行地址同样能手型点击 */
+.crepe-root :deep(.milkdown-link-preview .link-display) {
+  cursor: pointer;
+}
+
+/* 笔记引用链接（note/<id>）的气泡隐藏「编辑」按钮：手动改 href 会把双链指向改坏；
+   复制按钮（已改走目录路径）与删除按钮（取消引用，正文保留）不受影响；外链仍可编辑 */
+.crepe-root :deep(.milkdown-link-preview.xh-note-link .link-edit-button) {
+  display: none;
 }
 
 .mode-switch {
@@ -3066,6 +3379,9 @@ function onEditorAreaMouseDown(e: MouseEvent) {
 
 .md-preview :deep(a) {
   color: var(--brand-500);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
 }
 
 .md-preview :deep(blockquote) {

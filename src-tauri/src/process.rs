@@ -342,6 +342,50 @@ pub fn open_path(path: &str) -> Result<(), String> {
     opener::open(path).map_err(|e| format!("打开路径失败: {}", e))
 }
 
+/// 在文件资源管理器中打开路径所在目录并选中该项（速达右键「打开文件所在位置」）。
+/// 文件与文件夹通用：`explorer /select,<绝对路径>` 会打开其父目录并把该项高亮选中。
+pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("路径为空".to_string());
+    }
+    let target = std::path::Path::new(path);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // /select 后面必须是绝对路径：相对路径由 explorer 按它自己的当前目录解析，会定位错。
+        // canonicalize 失败（路径暂时不存在/权限）时退回原值，仍能打开所在目录。
+        // canonicalize 给的是 `\\?\` verbatim 形式：Rust 自己的 fs 认，但交给外部进程不行——
+        // explorer 的 /select 不剥该前缀，定位失败退回「文档」目录，故按约定 45 过
+        // paths::simplify_path 归一（UNC 的 `\\?\UNC\` 也一并还原成 `\\server\share`）。
+        let abs = std::fs::canonicalize(target)
+            .map(|p| crate::paths::simplify_path(&p))
+            .unwrap_or_else(|_| target.to_path_buf());
+        // explorer 的 /select, 不按 CommandLineToArgvW 解析：路径含空格时若不加引号会被截断，
+        // 定位失败即回退打开「文档」目录；而按常规交给 Rust 给整段参数加引号，又会把 `/select,`
+        // 一起包进引号同样失效。故用 raw_arg 原样传入 `/select,"<绝对路径>"`（路径自带引号），
+        // 含空格与不含空格两种路径都正确。
+        Command::new("explorer")
+            .raw_arg(explorer_select_arg(&abs))
+            .spawn()
+            .map_err(|e| format!("打开文件所在位置失败: {}", e))?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 非 Windows 无「选中」等价语义：退回打开其所在目录
+        let dir = if target.is_dir() { target } else { target.parent().unwrap_or(target) };
+        opener::open(dir).map_err(|e| format!("打开所在文件夹失败: {}", e))
+    }
+}
+
+/// 构造 explorer「打开所在位置并选中」的参数串：`/select,"<绝对路径>"`。
+/// 路径必须自带引号（原因见 `reveal_in_explorer` 注释），且调用侧须用 `raw_arg` 原样传入，
+/// 不能再交给 Rust 自动转义——故抽成纯函数，便于回归测试引号格式。
+#[cfg(target_os = "windows")]
+fn explorer_select_arg(abs: &std::path::Path) -> String {
+    format!("/select,\"{}\"", abs.display())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +414,21 @@ mod tests {
         assert_eq!(exe_file_name("/usr/bin/firefox").as_deref(), Some("firefox"));
         assert_eq!(exe_file_name("chrome.exe").as_deref(), Some("chrome.exe"));
         assert_eq!(exe_file_name(""), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn explorer_select_arg_quotes_path_with_spaces() {
+        // 含空格路径必须整体加引号（explorer 不按常规 argv 解析），否则会被截断定位到「文档」
+        assert_eq!(
+            explorer_select_arg(std::path::Path::new(r"C:\Program Files\Some App\app.exe")),
+            r#"/select,"C:\Program Files\Some App\app.exe""#
+        );
+        // 无空格路径也一律加引号，行为统一
+        assert_eq!(
+            explorer_select_arg(std::path::Path::new(r"C:\app\app.exe")),
+            r#"/select,"C:\app\app.exe""#
+        );
     }
 
     #[test]
