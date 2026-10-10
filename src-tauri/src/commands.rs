@@ -3380,7 +3380,7 @@ pub struct BrowserBookmark {
     pub target: String,
     /// 书签所在文件夹（用 `/` 连接层级；顶层书签栏内为空 → 「书签栏」等根名）
     pub folder: String,
-    /// 来源浏览器名（Chrome / Edge / Brave / Chromium）
+    /// 来源浏览器名（Chrome / Edge / Brave / Chromium / Tabbit）
     pub browser: String,
 }
 
@@ -3409,7 +3409,7 @@ pub struct BrowserBookmarkScan {
     pub truncated: usize,
 }
 
-/// 读取 Chromium 系浏览器书签（Chrome / Edge / Brave / Chromium）。
+/// 读取 Chromium 系浏览器书签（Chrome / Edge / Brave / Chromium / Tabbit）。
 /// 纯文件读取（不跑 PowerShell、不读历史），遍历各浏览器 User Data 下所有配置目录的
 /// `Bookmarks` **与 `AccountBookmarks`**（后者是登录 Google 账号后的账号存储，存在只写
 /// 它而无本地 Bookmarks 的机器），递归 roots 收集 `type=url` 节点；`dedupe` 为 true 时
@@ -3430,11 +3430,13 @@ pub fn scan_browser_bookmarks(dedupe: bool) -> Result<BrowserBookmarkScan, Strin
         });
     };
     // (展示名, User Data 相对路径)；均为 Chromium 系，Bookmarks 结构一致
-    let vendors: [(&str, &str); 4] = [
+    let vendors: [(&str, &str); 5] = [
         ("Chrome", r"Google\Chrome\User Data"),
         ("Edge", r"Microsoft\Edge\User Data"),
         ("Brave", r"BraveSoftware\Brave-Browser\User Data"),
         ("Chromium", r"Chromium\User Data"),
+        // 美团光年之外 Tabbit AI 浏览器，Chromium 内核，User Data 结构同 Chrome
+        ("Tabbit", r"Tabbit Browser\User Data"),
     ];
 
     let mut found: Vec<BrowserBookmark> = Vec::new();
