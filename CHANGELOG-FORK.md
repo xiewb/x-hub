@@ -45,9 +45,29 @@
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 | 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
+| 17 | 2026-10-10 | `c462de9`→待提交 | v0.8.1 | 本条 | 速达新增浏览器标签页扫描导入（`scan_browser_tabs`）：Chromium 系（Chrome/Edge/Brave/Chromium/Tabbit）SNSS 会话解析（cmd6 导航/cmd25 tab→组/cmd27 组名）+ Firefox recovery.jsonlz4；分组归属三级兜底（cmd25→同步库 LevelDB 原始特征扫描→书签树前缀匹配，URL 规范化最长前缀）。修复：Sessions 路径（User Data\<profile>\Sessions 遍历全部 profile）、混合组名截断漏检（「垣信NMC」等 CJK+ASCII 组名整组丢失）、同 URL 全局去重吞掉已归组条目（改为归组条目优先保留） |
 | 16 | 2026-10-10 | `a85e1db`→`5ef829b` | v0.8.1 | 待提交 | 合并上游 v0.8.1（19 提交）：速记双链补全增强（键盘滚动/目录标注/全量渲染性能优化）、智能括号兼容中文输入法、标签索引方向修复；速达书签导入按浏览器分组勾选+网址去重开关、AccountBookmarks 账号书签扫描、打开文件所在位置 explorer /select 修复；主窗口去黑边、待办截止跨年补年份。零冲突，fork 特性无损 |
 | 15 | 2026-10-08 | `6e302db`→`a85e1db` | v0.8.0+ | 待提交 | 合并 v0.8.0 标签后上游 2 提交：CI 升级 GitHub Actions 到 Node 24 运行时（ci.yml/release.yml）、更新交流群二维码（② 群，新增 assets/wechat-group-qr.png）；纯 CI/文档变更零冲突，fork 特性无损 |
 | 14 | 2026-10-07 | `33bbcd2`→`6e302db` | v0.8.0 | 已提交 `7241450` | 合并上游 4 提交（速记大改造：文件夹树/回收站体系/双链/图片 GC/AI 美化/导入导出，日历待办横排 #30，速记树拖拽落点与 AI 整理丢图修复，CI 升 Node 24）；58 文件 +8079/-756。冲突 8 文件 23 块手工合并：回收站双实现归一（上游为主+fork 兼容层 soft_delete/list_trash/empty_trash），NoteEditor 双特性并集（fork 工具栏/查找替换/大纲/CodeMirror 源码模式 + 上游 AI 美化/双链面板/图片语法修复，textarea 触点适配 CM 实例 API），NoteList.vue 随上游删除（SpeednoteView 取代，fork 版留存于历史） |
+
+---
+
+### #17（2026-10-10）速达浏览器标签页扫描导入与分组归属修复
+
+**功能**（提交 `757e5e0`、`f6d9f55`、`8bd516e`、`c462de9`）：
+
+- 新增 Tauri 命令 `scan_browser_tabs` + 前端 SudaScanDialog `tabs` 模式；扫描类型 BrowserTabScan 携带 note 说明会话快照口径（浏览器运行中最新快照被锁定，读到的是上一次完整会话）
+- Chromium 系：解析 `User Data/<profile>/Sessions/Session_*` SNSS——cmd6 UpdateTabNavigation（tab_id/index/url/title，title 在 referrer 之前的 str16 UTF-16LE）、cmd25 SetTabGroup（tab→组GUID）、cmd27 SetTabGroupMetadata2（组GUID→名称）；标签页取修改时间最新的含导航记录的可读文件，组名/归属跨全部可读文件累积
+- Firefox：`sessionstore-backups/recovery.jsonlz4`（mozLZ4，lz4_flex 解压）
+- 分组归属三级兕底：cmd25 归属 → Tabbit 同步库（Sync Data LevelDB 原始字节特征扫描：GUID+CJK组名+0x18 color 字节+URL 近邻归属）→ 书签树（Tabbit 将保存标签组同步进书签「标签组」文件夹）规范化 URL 最长前缀匹配
+
+**本次修复**（垣信NMC 组缺失、其它组内容偏少）：
+
+1. **混合组名截断漏检**：`extract_sync_tab_groups` 组名解析只接受 CJK 三字节序列，遇「垣信NMC」中 ASCII 字母即停，后续 0x18 color 字节校验错位导致整条记录丢弃——组名表无此组，其成员 URL 全部落入未分组。改为 CJK+ASCII 字母数字混合解析（要求 ≥1 个 CJK、总长 2~24 字、后随 0x18+0..9 防页面标题误报）
+2. **去重吞掉归组条目**：`scan_browser_tabs` 按 (browser, url) 全局 retain 去重，同 URL 首次出现的未分组条目把后出现的已归组条目吞掉，表现为各组内容变少。改为归组条目优先保留（重复 URL 中保留有组名的）
+3. 内容偏少的另一部分原因是快照口径：浏览器运行中最新 SNSS 被独占锁定，只能读到上一次完整会话；关闭浏览器后重扫即为当前会话（弹窗 note 已说明）
+
+**验证**：`cargo check` 通过；346 个单测全绿；release 编译成功。
 
 ---
 

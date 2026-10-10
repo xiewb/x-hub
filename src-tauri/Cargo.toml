@@ -68,6 +68,7 @@ windows-sys = { version = "0.61", features = [
 webview2-com = "0.38.2"
 windows-core = "0.61"
 lz4_flex = "0.10.0"
+rusty-leveldb = "4.0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"
