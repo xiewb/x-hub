@@ -162,6 +162,10 @@ src-tauri/
 
 > 二维码 7 天内有效，过期后重新进入会更新。若二维码失效，请到 [Issues](https://github.com/dckxx/x-hub/issues) 留言获取最新二维码。
 
+## 🔄 Fork 合并约定
+
+- 合并上游新版本时，必须先从 GitHub 检查拉取（真上游为 `github.com/dckxx/x-hub`，本地 `E:\github\dckxx\x-hub` 仅为镜像，需先在镜像 `git fetch origin` + `--ff-only` 同步），再在 `D:\source\x-hub` 执行 `git fetch upstream --tags` 合并；详细流程见 [MERGE-GUIDE.md](MERGE-GUIDE.md)。
+
 ## 📄 License
 
 MIT
