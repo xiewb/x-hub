@@ -45,12 +45,30 @@
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 | 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
+| 18 | 2026-10-13 | `4808708`→`4e511e8` | v0.8.3 | 待提交 | 合并上游 v0.8.3（3 提交）：工作台日记模块、分屏预览改只读 Crepe 与整图位图复制、剪贴板纯文本提取（fragmentToPlainText）。冲突 3 文件：tauri.conf.json 保留 fork 全禁 CSP 改写（修订 #11 依据），NoteEditor 上游 buildCrepe/mountEditor 拆分结构 + fork CodeMirrorSource 三模式并集，Suda 双方新按钮并存 |
 | 17 | 2026-10-10 | `c462de9`→待提交 | v0.8.1 | 本条 | 速达新增浏览器标签页扫描导入（`scan_browser_tabs`）：Chromium 系（Chrome/Edge/Brave/Chromium/Tabbit）SNSS 会话解析（cmd6 导航/cmd25 tab→组/cmd27 组名）+ Firefox recovery.jsonlz4；分组归属三级兜底（cmd25→同步库 LevelDB 原始特征扫描→书签树前缀匹配，URL 规范化最长前缀）。修复：Sessions 路径（User Data\<profile>\Sessions 遍历全部 profile）、混合组名截断漏检（「垣信NMC」等 CJK+ASCII 组名整组丢失）、同 URL 全局去重吞掉已归组条目（改为归组条目优先保留） |
 | 16 | 2026-10-10 | `a85e1db`→`5ef829b` | v0.8.1 | 待提交 | 合并上游 v0.8.1（19 提交）：速记双链补全增强（键盘滚动/目录标注/全量渲染性能优化）、智能括号兼容中文输入法、标签索引方向修复；速达书签导入按浏览器分组勾选+网址去重开关、AccountBookmarks 账号书签扫描、打开文件所在位置 explorer /select 修复；主窗口去黑边、待办截止跨年补年份。零冲突，fork 特性无损 |
 | 15 | 2026-10-08 | `6e302db`→`a85e1db` | v0.8.0+ | 待提交 | 合并 v0.8.0 标签后上游 2 提交：CI 升级 GitHub Actions 到 Node 24 运行时（ci.yml/release.yml）、更新交流群二维码（② 群，新增 assets/wechat-group-qr.png）；纯 CI/文档变更零冲突，fork 特性无损 |
 | 14 | 2026-10-07 | `33bbcd2`→`6e302db` | v0.8.0 | 已提交 `7241450` | 合并上游 4 提交（速记大改造：文件夹树/回收站体系/双链/图片 GC/AI 美化/导入导出，日历待办横排 #30，速记树拖拽落点与 AI 整理丢图修复，CI 升 Node 24）；58 文件 +8079/-756。冲突 8 文件 23 块手工合并：回收站双实现归一（上游为主+fork 兼容层 soft_delete/list_trash/empty_trash），NoteEditor 双特性并集（fork 工具栏/查找替换/大纲/CodeMirror 源码模式 + 上游 AI 美化/双链面板/图片语法修复，textarea 触点适配 CM 实例 API），NoteList.vue 随上游删除（SpeednoteView 取代，fork 版留存于历史） |
 
 ---
+
+### #18（2026-10-13）合并上游 v0.8.3：日记模块与分屏预览 Crepe 化
+
+**上游内容清单**（v0.8.2..v0.8.3，共 3 提交）：
+- 工作台新增「日记」模块（DiaryCard.vue）：宽幅输入框回车即存速记「日记」文件夹；布局编辑器/预览同步支持
+- 分屏预览右侧从 v-html（marked）改为只读 Crepe 实例（previewCrepe/previewRootEl/previewScroller，与编辑态同一渲染器）；分屏预览整图 Ctrl+C 走位图复制（按实例分流）
+- 剪贴板纯文本提取：新增 utils/clipboardPlainText.ts（fragmentToPlainText）替代选区序列化，粘出无 `*`/`[ ]` 转义；新增测试 tests/clipboardPlainText.test.mjs
+
+**冲突与决策**（3 文件）：
+
+| 文件 | 决策 |
+|------|------|
+| `src-tauri/tauri.conf.json` | `dangerousDisableAssetCspModification` 上游改为 `["style-src"]`，fork 保留 `true`——fork 修订 #11 的根因是 CodeMirror 等运行时注入的 style/script 被nonce 拒绝，需全禁 CSP 改写才能覆盖 fork 动态注入场景 |
+| `src/components/NoteEditor.vue` | 采用上游 buildCrepe/mountEditor 拆分结构，fork 的 remarkLineBreak + ==高亮== 扩展挂入 buildCrepe 尾部；源码/分屏源码侧保留 fork CodeMirrorSource，分屏右侧改用上游只读 Crepe（预览 v-html 链路 previewHtml/onPreviewClick/previewEl 随上游删除）；滚动同步融合：源取 CM `view.scrollDOM`，预览取 `previewScroller()`，scroll 监听在 watcher 挂 scrollDOM；上游 textarea API 触点（AI 选区捕获 `selectionStart/End`、`setSelectionRange`）按约定适配 CM 实例 API（`view.state.selection.main` / `view.dispatch({selection})`） |
+| `src/components/Suda.vue` | fork「导入浏览器标签页」按钮与上游「修复图标缓存」按钮并存 |
+
+**验证**：vue-tsc 类型检查通过；`cargo check` + 351 个 Rust 测试通过；前端测试 clipboardPlainText 134 断言全过。
 
 ### #17（2026-10-10）速达浏览器标签页扫描导入与分组归属修复
 

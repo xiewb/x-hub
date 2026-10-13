@@ -468,6 +468,17 @@ pub fn resize_zone(
     zone::resize(&conn, id, cols, rows)
 }
 
+/// 设置分区级图标缩放覆盖（issue #37；None = 清除覆盖，跟随全局 suda_icon_scale）
+#[tauri::command]
+pub fn set_zone_scale(
+    state: State<'_, DbState>,
+    id: i64,
+    scale: Option<f64>,
+) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    zone::set_scale(&conn, id, scale)
+}
+
 /// 批量改分区归属（右键「移动到分区」/ 删分区撤销恢复），不动 sort_order
 #[tauri::command]
 pub fn set_resources_zone(
@@ -2946,6 +2957,36 @@ pub fn note_image_url(name: &str) -> String {
     format!("http://xhub-note.localhost/{}", name)
 }
 
+/// 从 xhub-note 协议 URL 里取图片文件名（16 位哈希 + 白名单扩展，协议侧同款口径）。
+/// 尾随任何多余字符（query / 路径穿越 / 空串）一律判非法——这是借 URL 把数据根外
+/// 任意文件写进剪贴板的唯一入口，必须从严。
+fn note_image_name_from_url(url: &str) -> Option<String> {
+    const NEEDLE: &str = "xhub-note.localhost/";
+    let tail = url.split_once(NEEDLE)?.1;
+    let name: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.')
+        .collect();
+    (name.len() == tail.len() && is_note_image_name(&name)).then_some(name)
+}
+
+/// 复制笔记内嵌图片到系统剪贴板（灯箱「复制图片」按钮 / 整图选中 Ctrl+C）。
+/// 入参为笔记里的 xhub-note 协议 URL，文件名按协议同款口径校验后才拼数据根路径。
+/// 写入后清掉回声指纹：从笔记复制图片与从浏览器复制一样应正常进剪贴板历史
+/// （历史项自身回写才需要抑制回声，这里不是）。
+#[tauri::command]
+pub fn copy_note_image(url: String) -> Result<(), String> {
+    let name =
+        note_image_name_from_url(&url).ok_or_else(|| "不是有效的笔记图片地址".to_string())?;
+    let path = crate::paths::data_root()
+        .join("notes")
+        .join("images")
+        .join(&name);
+    crate::clipboard::set_clipboard_image(&path.to_string_lossy())?;
+    crate::clipboard::clear_self_set_fingerprint();
+    Ok(())
+}
+
 // ---------- 扫描已安装应用 ----------
 
 #[derive(serde::Serialize)]
@@ -3088,60 +3129,63 @@ fn batch_extract_icons(apps: &[(String, String)]) -> Result<Vec<Option<String>>,
     Ok(result)
 }
 
-/// 图标缓存清扫（启动 15s 后一次性后台跑，见 lib.rs）：
-/// 把不健康的缓存按 target 键就地重提——含旧 PowerShell 链路的 32×32 低清缓存
-/// （宽度判旧），**以及 v0.7.6 一度产出的「小帧居中垫图」鬼影缓存**（宽度是
-/// 256、字形墨迹只占中间一小块，须解码看墨迹，icon_cache_usable 统一判定）。
-/// 只处理「资源图标路径 == target 的缓存键」的条目——用户手动导入的图标
-/// （键 = 图标文件路径哈希）与网页 favicon（fav- 前缀）不越权重置；
-/// 重提失败保留旧图。图标路径不变，前端下次挂载/重启即见修复图。
-pub fn sweep_stale_icons(app: &tauri::AppHandle) {
-    use tauri::Manager;
+/// 图标缓存清扫统计（速达页「修复图标」手动触发后的结果）。
+#[derive(serde::Serialize)]
+pub struct IconSweepSummary {
+    /// 检查的自动提取键条目数（去重后；手动导入/favicon 不在统计内）
+    pub scanned: usize,
+    /// 判为不健康并重提的缓存数
+    pub reextracted: usize,
+    /// 重提失败数（失败项保留旧图）
+    pub failed: usize,
+}
 
-    let Some(state) = app.try_state::<DbState>() else {
-        return;
-    };
-    // 读完全量资源立刻放锁：后续 COM 提取是秒级 IO，不能攥着 DB 互斥锁
+/// 图标缓存清扫（速达页右上角「修复图标」手动触发；2026-10-11 前为启动 15s
+/// 自动跑，按需求改为手动）：把不健康的缓存按 target 键就地重提——含旧
+/// PowerShell 链路的 32×32 低清缓存（宽度判旧），**以及 v0.7.6 一度产出的
+/// 「小帧居中垫图」鬼影缓存**（宽度是 256、字形墨迹只占中间一小块，须解码看
+/// 墨迹，icon_cache_usable 统一判定）。只处理「资源图标路径 == target 的缓存键」
+/// 的条目——用户手动导入的图标（键 = 图标文件路径哈希）与网页 favicon（fav- 前缀）
+/// 不越权重置；重提失败保留旧图。图标路径不变，前端清扫完成后带版本参数刷新。
+/// 必须 async + spawn_blocking：全量解码 PNG 与 COM 提取是秒级 IO，同步命令会
+/// 卡死主线程冻结 UI（同 scan_installed_apps）。
+#[tauri::command]
+pub async fn sweep_stale_icons(state: tauri::State<'_, DbState>) -> Result<IconSweepSummary, String> {
+    // 读完全量资源立刻放锁：后续解码/COM 提取是秒级 IO，不能攥着 DB 互斥锁
     let resources = {
-        let Ok(conn) = state.0.lock() else {
-            return;
-        };
-        match crate::repo::resource::list_all(&conn) {
-            Ok(rs) => rs,
-            Err(e) => {
-                log::warn!("图标清扫：读取资源列表失败: {e}");
-                return;
+        let conn = state.0.lock().map_err(|_| "数据库不可用".to_string())?;
+        crate::repo::resource::list_all(&conn).map_err(|e| format!("读取资源列表失败: {e}"))?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut scanned = 0usize;
+        let mut stale: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for r in &resources {
+            let Some(icon) = &r.icon else { continue };
+            // 只认自动提取键（icon == hash(target).png），手动导入/favicon 不动
+            if icon_cache_path(&r.target) != std::path::PathBuf::from(icon) {
+                continue;
+            }
+            if !seen.insert(r.target.clone()) {
+                continue;
+            }
+            scanned += 1;
+            if !icon_cache_usable(std::path::Path::new(icon)) {
+                stale.push(r.target.clone());
             }
         }
-    };
-
-    let mut stale: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for r in &resources {
-        let Some(icon) = &r.icon else { continue };
-        // 只认自动提取键（icon == hash(target).png），手动导入/favicon 不动
-        if icon_cache_path(&r.target) != std::path::PathBuf::from(icon) {
-            continue;
+        if stale.is_empty() {
+            log::info!("图标清扫：{scanned} 个缓存全部健康，无需重提");
+            return IconSweepSummary { scanned, reextracted: 0, failed: 0 };
         }
-        if !seen.insert(r.target.clone()) {
-            continue;
-        }
-        let p = std::path::Path::new(icon);
-        if !icon_cache_usable(p) {
-            stale.push(r.target.clone());
-        }
-    }
-    if stale.is_empty() {
-        return;
-    }
-    log::info!("图标清扫：{} 个不健康缓存待重提", stale.len());
-    let mut ok = 0;
-    for target in &stale {
-        if extract_app_icon(target).is_some() {
-            ok += 1;
-        }
-    }
-    log::info!("图标清扫完成：{}/{} 重提成功（失败项保留旧图）", ok, stale.len());
+        log::info!("图标清扫：{} 个不健康缓存待重提", stale.len());
+        let failed = stale.iter().filter(|t| extract_app_icon(t).is_none()).count();
+        let reextracted = stale.len() - failed;
+        log::info!("图标清扫完成：{reextracted}/{} 重提成功（失败项保留旧图）", stale.len());
+        IconSweepSummary { scanned, reextracted, failed }
+    })
+    .await
+    .map_err(|e| format!("图标清扫失败: {e}"))
 }
 
 // ---------- 扫描桌面 ----------
@@ -5256,6 +5300,32 @@ fn parse_kind(kind: &str) -> Result<ResourceKind, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// copy_note_image 的 URL 入口校验：合法 xhub-note URL 放行，
+    /// 外站地址 / 尾随 query / 哈希长度不符 / 越权扩展 / 路径穿越一律拒绝
+    #[test]
+    fn note_image_name_from_url_validates_like_protocol() {
+        assert_eq!(
+            note_image_name_from_url("http://xhub-note.localhost/0123456789abcdef.png").as_deref(),
+            Some("0123456789abcdef.png")
+        );
+        assert!(note_image_name_from_url("http://xhub-note.localhost/0123456789abcdef.webp").is_some());
+        assert!(note_image_name_from_url("http://example.com/0123456789abcdef.png").is_none());
+        assert!(
+            note_image_name_from_url("http://xhub-note.localhost/0123456789abcdef.png?x=1")
+                .is_none(),
+            "尾随 query 必须整体判非法"
+        );
+        assert!(note_image_name_from_url("http://xhub-note.localhost/abc.png").is_none());
+        assert!(
+            note_image_name_from_url("http://xhub-note.localhost/0123456789abcdef.exe").is_none(),
+            "白名单外的扩展名不得放行"
+        );
+        assert!(
+            note_image_name_from_url("http://xhub-note.localhost/../../app.json").is_none(),
+            "路径穿越不得放行"
+        );
+    }
 
     /// 平台模型的 Key 是占位符（真凭据是账号登录态、请求时现取），**任何界面都不该拿到它**：
     /// 展示出来只会有两种坏结果 —— 让人以为平台 Key 泄露了，或让人以为这里必须填 Key。

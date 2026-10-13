@@ -51,13 +51,15 @@ export interface ResourceSubcategory {
 }
 
 /** 速达分区：「全部」tab 的自定义成组陈列（跨大类、无层级）；一个都没有时「全部」保持平铺。
- *  cols/rows = 分区框尺寸（卡片格数，新建默认 3×2，下限语义：内容超出按行自动膨胀） */
+ *  cols/rows = 分区框尺寸（卡片格数，新建默认 3×2，下限语义：内容超出按行自动膨胀）；
+ *  scale = 分区级图标缩放覆盖（issue #37），null = 跟随全局 config.suda_icon_scale */
 export interface ResourceZone {
   id: number
   name: string
   sort_order: number
   cols: number
   rows: number
+  scale: number | null
 }
 
 /** 速达独立应用内浏览器窗口槽位快照（chrome 页挂载时拉取） */
@@ -339,6 +341,8 @@ export interface AppConfig {
   suda_custom_modules: SudaCustomModuleConfig[]
   /** 速达内嵌面板是否显示工具栏（默认不显示，隐藏时整个面板区域只渲染网页） */
   suda_panel_toolbar: boolean
+  /** 速达卡片/图标全局缩放档位（issue #37）：0.8 小 / 1.0 标准 / 1.2 大 / 1.4 特大；分区级可覆盖 */
+  suda_icon_scale: number
   /** 记录剪贴板图片（默认开启） */
   clipboard_image_enabled: boolean
   /** 记录剪贴板文件（默认开启） */
@@ -1089,6 +1093,9 @@ export const tauriApi = {
   /** 调整分区框尺寸（卡片格数 1..=12；拖拽缩放已按格吸附，这里落最终值） */
   resizeZone: (id: number, cols: number, rows: number) =>
     invoke<void>('resize_zone', { id, cols, rows }),
+  /** 设置分区级图标缩放覆盖（issue #37）；scale=null 清除覆盖、跟随全局 suda_icon_scale */
+  setZoneScale: (id: number, scale: number | null) =>
+    invoke<void>('set_zone_scale', { id, scale }),
   /** 批量改分区归属（右键移动/删分区撤销），不动 sort_order；zoneId=null 移回未分区 */
   setResourcesZone: (ids: number[], zoneId: number | null) =>
     invoke<void>('set_resources_zone', { ids, zoneId }),
@@ -1267,6 +1274,10 @@ export const tauriApi = {
   getRunningProcesses: () => invoke<string[]>('get_running_processes'),
   importIconFile: (source: string) =>
     invoke<string | null>('import_icon_file', { source }),
+  /** 手动修复图标缓存：全量检查速达自动提取的图标（手动导入/favicon 不动），
+   *  重提模糊/鬼影缓存；返回 检查数 / 重提数 / 失败数（失败保留旧图） */
+  sweepStaleIcons: () =>
+    invoke<{ scanned: number; reextracted: number; failed: number }>('sweep_stale_icons'),
   importWallpaper: (source: string) =>
     invoke<string>('import_wallpaper', { source }),
   /** 清理壁纸目录中当前配置（亮/暗）均未引用的文件；前端先改配置再调用 */
@@ -1274,6 +1285,8 @@ export const tauriApi = {
   /** 保存笔记图片（base64，不含 data: 前缀）：落盘 notes/images，返回 xhub-note 协议 URL */
   importNoteImage: (dataB64: string, ext: string) =>
     invoke<string>('import_note_image', { dataB64, ext }),
+  /** 复制笔记内嵌图片到系统剪贴板（xhub-note URL，后端按协议同款口径校验文件名） */
+  copyNoteImage: (url: string) => invoke<void>('copy_note_image', { url }),
   inspectPath: (path: string) =>
     invoke<{ name: string; is_dir: boolean }>('inspect_path', { path }),
   listTags: () => invoke<Tag[]>('list_tags'),
