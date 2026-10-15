@@ -197,6 +197,9 @@ pub struct ExtensionManifest {
     /// 作者署名（市场卡片与详情页展示；发布弹窗可补填并回写本字段）
     #[serde(default)]
     pub author: Option<String>,
+    /// 分类（市场/已安装列表分类筛选用；发布弹窗可选并回写本字段，缺省 = 未分类）
+    #[serde(default)]
+    pub category: Option<String>,
     /// 扩展默认配置（对象）；用户覆盖存 `.config.json`，读取时用户覆盖优先（配置分层）
     #[serde(default)]
     pub config: Map<String, Value>,
@@ -233,6 +236,8 @@ pub struct ExtensionEntry {
     pub description: String,
     /// 作者署名（manifest.author；发布弹窗预填与回写用）
     pub author: Option<String>,
+    /// 分类（manifest.category；扩展中心分类筛选用，None = 未分类）
+    pub category: Option<String>,
     /// 图标文件绝对路径（存在时才非空）
     pub icon: Option<String>,
     /// 扩展目录绝对路径
@@ -394,6 +399,7 @@ fn load_extension(dir: &Path, source: &str) -> ExtensionEntry {
         permissions: Vec::new(),
         description: String::new(),
         author: None,
+        category: None,
         icon: None,
         dir: dir_str.clone(),
         source: source.to_string(),
@@ -447,6 +453,7 @@ fn load_extension(dir: &Path, source: &str) -> ExtensionEntry {
         permissions: manifest.permissions,
         description: manifest.description,
         author: manifest.author,
+        category: manifest.category,
         icon,
         dir: dir_str,
         source: source.to_string(),

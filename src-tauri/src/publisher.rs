@@ -134,6 +134,33 @@ pub fn set_author_in_dir(dir: &Path, author: &str) -> Result<Option<String>, Str
     Ok(Some(old))
 }
 
+/// 把分类写进扩展目录 manifest.json 的顶层 `category` 字段（发布弹窗「分类」的落盘动作）。
+///
+/// 与 `set_author_in_dir` 同一条「Value 改字段 + `.` 开头临时文件原子替换」路径：键序保持原样，
+/// 其余字段一律不动；服务端发布时从包内 manifest 读出写进市场清单，客户端据此做分类筛选。
+pub fn set_category_in_dir(dir: &Path, category: &str) -> Result<Option<String>, String> {
+    let path = dir.join("manifest.json");
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("IO_ERROR: 读取 manifest.json 失败 {e}"))?;
+    let mut value: Value = serde_json::from_str(&raw).map_err(|e| format!("manifest 解析失败：{e}"))?;
+    let old = value
+        .get("category")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if old == category {
+        return Ok(None);
+    }
+    value["category"] = Value::String(category.to_string());
+    let mut out = serde_json::to_string_pretty(&value).map_err(|e| format!("manifest 序列化失败 {e}"))?;
+    if raw.ends_with('\n') {
+        out.push('\n');
+    }
+    let tmp = dir.join(".manifest.json.category-tmp");
+    std::fs::write(&tmp, out).map_err(|e| format!("IO_ERROR: 写入 manifest 失败 {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("IO_ERROR: 替换 manifest.json 失败 {e}"))?;
+    Ok(Some(old))
+}
+
 /// 上传打包产物：multipart（package 文件 + 展示字段），返回服务端结论
 async fn upload(
     base: &str,
@@ -217,6 +244,9 @@ pub async fn dev_submit(
     // 服务端发布时从包内 manifest 读署名写进市场清单，市场卡片与详情页展示的就是它。
     // 空 = 不动 manifest（保留现有署名）。
     author: Option<String>,
+    // 发布弹窗「分类」：非空且与 manifest 当前值不同时回写 `category` 字段再打包——
+    // 服务端发布时透传进市场清单，扩展中心的分类筛选按它归组。空 = 不动 manifest。
+    category: Option<String>,
 ) -> Result<SubmitResult, String> {
     let token = crate::account::session_token().ok_or("UNAUTHORIZED: 请先在「设置 → 账号」登录")?;
     let base = crate::account::base_url();
@@ -240,6 +270,14 @@ pub async fn dev_submit(
         let dir = crate::ext_protocol::resolve_ext_dir(&app, &id)?;
         if let Some(old) = set_author_in_dir(&dir, a)? {
             log::info!("作者署名回写: {id}「{old}」->「{a}」");
+        }
+    }
+
+    // 分类同样「先落盘再打包」：包内 manifest 带上分类，服务端才透传得进清单。
+    if let Some(c) = category.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let dir = crate::ext_protocol::resolve_ext_dir(&app, &id)?;
+        if let Some(old) = set_category_in_dir(&dir, c)? {
+            log::info!("分类回写: {id}「{old}」->「{c}」");
         }
     }
 

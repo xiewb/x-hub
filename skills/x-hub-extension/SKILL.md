@@ -26,7 +26,7 @@ description: "Generate an x-hub extension (扩展 / 插件): manifest.json + ent
 | `references/service.md` | 扩展带 Node 后端时 |
 | `references/convert-html.md` | 改造现成网页时——去 CDN / 主题映射 / 存储迁移 |
 | `references/debug-deploy.md` | 代码写完要跑起来、报交付清单、用户提到发布上架时 |
-| `references/pitfalls.md` | 写代码前扫一眼、交付前逐条对一遍（21 条实机踩坑） |
+| `references/pitfalls.md` | 写代码前扫一眼、交付前逐条对一遍（24 条实机踩坑） |
 | `templates/` | 生成骨架时**直接复制**（都在 `templates/` 目录下）：`entry.view.html`、`entry.module.html`、`service.index.js`、`manifest.web.json`、`manifest.service.json` |
 | `xhub.d.ts` | 复制进用户项目换编辑器补全（扩展本身不 import 它） |
 
@@ -195,7 +195,7 @@ skill 的使用者手里通常只有**装好的 x-hub 应用** + 这个 skill �
 2. **`id` 用你自己的反向域名**（`com.你的名字.短名`，全小写、必须含 `.`）。⚠️ **绝不要用 `com.x-hub.*`**——那是平台保留命名空间（只给官方自营），第三方用它本地预检只提示不拦、到服务端关卡才被拒。`version` 必须是 **`x.y.z` 三段纯数字**（`1.0.0-beta` 之类不合法）。`author` 填作者署名（用户名 / 团队名，市场卡片与详情页会展示它）：用户说过署名就照写，没说就先放占位、并在交付报告里说明去哪改（发布弹窗里也能补填，会写回 manifest.json）。
 3. **每个声明的 entry 都必须有真实文件**，否则扩展打不开。
 4. **写 CSS 前读 `references/theming.md`**——页面底用 `var(--xhub-page-bg, transparent)`、内容表面用 `var(--xhub-surface)`。**整页入口（view/window/drawer）的 body padding 按边距决策写**：默认 `0 20px 20px 0`，用户在 Step 3 选了「完全无边距」则 `0`（宿主零边距，留白全由扩展页负责）。
-5. `icon.svg` 手写一个简洁的即可（`viewBox="0 0 24 24"`，`stroke="currentColor"`）。
+5. `icon.svg` **必须自带配色，别用 `currentColor`**：宿主把图标当独立 `<img>` 渲染（侧栏固定区、扩展中心、市场卡片），img 加载的 SVG 没有继承色，`currentColor` 按 SVG 规范回落为**纯黑**——暗色主题 / 壁纸态（侧栏透明、图标直接叠在照片上）整块看不清（实机踩过，见 pitfalls 24）。推荐 app-tile 式画法：品牌色圆角方块底（`<rect rx="6">`）+ 白/浅色字形，任何背景都可读；字形也可直接用中高明度色。纯黑或纯白单色 + 透明底的图标不要交付。
 6. 入口是**静态 HTML**，可引用同目录 JS/CSS（相对路径自动解析）。零构建即可；用 Vite 等构建时指向 `dist/index.html`。
 7. 脚本直接调 `window.xhub.*`，**不要 import 任何 xhub 包**（桥由宿主注入）。
 8. **不要引用任何 CDN**。
@@ -203,7 +203,7 @@ skill 的使用者手里通常只有**装好的 x-hub 应用** + 这个 skill �
 
 ### Step 6 · 校验 + 交给用户真机跑
 
-生成后自己过一遍 `references/pitfalls.md`（21 条）与 `references/debug-deploy.md` 的自检清单，然后**必须**把这段操作指引给用户（这是唯一能看到真实效果的路）：
+生成后自己过一遍 `references/pitfalls.md`（24 条）与 `references/debug-deploy.md` 的自检清单，然后**必须**把这段操作指引给用户（这是唯一能看到真实效果的路）：
 
 > 1. 扩展中心 →「**我的扩展**」标签页 → 添加这个源码目录（须含 `manifest.json`）
 > 2. **添加即加载**（不需要任何开关）：打开扩展就能跑真机——**改代码约 1.5 秒自动重载**，可用真实数据；移除目录即撤销

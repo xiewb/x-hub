@@ -3,6 +3,8 @@ import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { ImagePlus, Info, X } from 'lucide-vue-next'
 import { useFocusTrap } from '../composables/useFocusTrap'
+import AppSelect from './AppSelect.vue'
+import { EXTENSION_CATEGORIES } from '../utils/extensionMeta'
 import {
   isTauri,
   tauriApi,
@@ -27,6 +29,17 @@ const homepage = ref('')
 const minAppVersion = ref('')
 /** 作者署名：预填 manifest.author，非空且与当前署名不同时提交会写回 manifest.json（市场卡片与详情页展示它） */
 const author = ref('')
+/** 分类：预填 manifest.category，选择后提交会写回 manifest.json（服务端发布时透传进市场清单，客户端按它做分类筛选）；
+ *  空串 = 不分类（不动 manifest 里的现有值，避免「忘了选」把老分类悄悄抹掉） */
+const category = ref('')
+/** 分类下拉候选：预设 + 「不分类」；manifest 里有预设之外的历史分类时一并列出，防手写分类无法回显 */
+const categoryOptions = computed(() => {
+  const opts: { value: string; label: string }[] = [{ value: '', label: '不分类' }]
+  for (const c of EXTENSION_CATEGORIES) opts.push({ value: c, label: c })
+  const current = (props.extension?.category ?? '').trim()
+  if (current && !EXTENSION_CATEGORIES.includes(current)) opts.push({ value: current, label: current })
+  return opts
+})
 /** 「发布版本」输入框：非空 = 提交时先把该版本写回扩展的 manifest.json 再打包；留空 = 按 manifest 当前版本发布（重提同一版的路径） */
 const newVersion = ref('')
 /** 本会话跟踪的当前 manifest 版本：props.extension 在提交后是旧值（列表要等 5s stamp 轮询才刷新），提交成功后用 result.version 就地更新 */
@@ -465,6 +478,7 @@ async function submit() {
       screenshots.value,
       newVersion.value.trim() || undefined,
       author.value.trim() || undefined,
+      category.value.trim() || undefined,
     )
     quota.value = result.value.quota ?? quota.value
     // 版本已随提交落盘：就地跟进当前版本（props.extension 是旧值，列表要等 stamp 轮询刷新），
@@ -522,6 +536,7 @@ function initDialog() {
   homepage.value = ''
   minAppVersion.value = ''
   author.value = props.extension?.author ?? ''
+  category.value = props.extension?.category ?? ''
   currentVersion.value = props.extension?.version ?? ''
   // 预填「发布版本」默认值（在架上 → 升一版；不在架上 → 原号重发，见 defaultNewVersion）；
   // 提交记录还在异步拉取，到位后由 watcher 校正（用户已动手则不覆盖）
@@ -639,7 +654,20 @@ onBeforeUnmount(() => {
               <input v-model="homepage" placeholder="https://…" />
             </label>
           </div>
-
+          <div class="pub-row">
+            <div class="pub-field pub-field-sm">
+              <span>分类</span>
+              <AppSelect
+                v-model="category"
+                :options="categoryOptions"
+                aria-label="扩展分类"
+                class="pub-category-select"
+                title="会写回扩展的 manifest.json（category 字段），用户在扩展中心按它筛选"
+              />
+              <p class="pub-field-hint">帮用户在扩展中心按分类找到它；选「不分类」则保持现状</p>
+            </div>
+            <div class="pub-field pub-field-sm"></div>
+          </div>
           <div class="pub-field">
             <div class="pub-shots-head">
               <span>截图（可选，最多 {{ MAX_SHOTS }} 张 · 单张 ≤ 2MB）</span>
@@ -916,6 +944,16 @@ onBeforeUnmount(() => {
 .pub-field-sm {
   flex: 1;
   min-width: 0;
+}
+/* 分类下拉：与其他输入框同宽（AppSelect 触发器宽度由使用方定） */
+.pub-category-select {
+  width: 100%;
+}
+.pub-field-hint {
+  margin: 4px 0 0;
+  font-size: 0.68rem;
+  line-height: 1.5;
+  color: var(--text-4, var(--text-3));
 }
 .pub-quota-detail {
   padding: 1px 8px;

@@ -413,12 +413,20 @@ pub const DEFAULT_SERVER_URL: &str = "https://x-hub.xfactor.top";
 /// 市场清单接口路径（服务端代理，客户端不再知道 COS 在哪里）。
 pub const MARKET_REGISTRY_PATH: &str = "/api/v1/market/registry";
 
+/// 市场安装上报接口路径（匿名 fire-and-forget；服务端按「机器 × 扩展」去重计数）。
+pub const MARKET_INSTALL_PATH: &str = "/api/v1/market/install";
+
 /// 应用升级清单接口路径（同上）。
 pub const UPDATE_MANIFEST_PATH: &str = "/api/v1/app/update";
 
 /// 市场清单地址（平台服务端接口，`.sig` 为同级 `{url}.sig`）。
 pub fn market_registry_url() -> String {
     format!("{DEFAULT_SERVER_URL}{MARKET_REGISTRY_PATH}")
+}
+
+/// 市场安装上报地址（与清单同源；失败静默，不影响安装本身）。
+pub fn market_install_url() -> String {
+    format!("{DEFAULT_SERVER_URL}{MARKET_INSTALL_PATH}")
 }
 
 /// 应用升级清单地址（平台服务端接口，`.sig` 为同级 `{url}.sig`）。

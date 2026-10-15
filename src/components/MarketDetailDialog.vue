@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ChevronLeft, ChevronRight, ExternalLink, ImageOff, Package, Shield, ShieldAlert, X } from 'lucide-vue-next'
+import { ChevronLeft, ChevronRight, ExternalLink, ImageOff, Package, Shield, ShieldAlert, ShieldCheck, X } from 'lucide-vue-next'
 import { useFocusTrap } from '../composables/useFocusTrap'
 import { isTauri, tauriApi, type MarketExtension } from '../api/tauri'
 import { accentOf } from '../composables/useResourceIcon'
+import { displayCategory, installCountText, isOfficialExt } from '../utils/extensionMeta'
 
 const props = defineProps<{
   extension: MarketExtension | null
@@ -148,7 +149,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 <span v-else :style="{ color: accentOf(m!.name).text }">{{ initial() }}</span>
               </span>
               <div class="md-title-text">
-                <h2 class="dialog-title">{{ m!.name }}</h2>
+                <h2 class="dialog-title">
+                  <!-- 名字包一层可收缩 span：flex 容器上 text-overflow 不生效，省略号必须落在文本项自己身上 -->
+                  <span class="dialog-title-text">{{ m!.name }}</span>
+                  <!-- 官方标识：与市场卡片同一判定口径（清单 official 标记 / com.x-hub.* 保留命名空间） -->
+                  <span v-if="isOfficialExt(m!)" class="md-official" title="官方扩展（平台官方自营）">
+                    <ShieldCheck :size="12" :stroke-width="2.2" aria-hidden="true" />
+                    官方
+                  </span>
+                </h2>
                 <span class="md-version">v{{ m!.version }}</span>
               </div>
             </div>
@@ -228,16 +237,24 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
                 <span class="md-meta-value">{{ m!.runtime === 'service' ? '服务' : 'Web' }}</span>
               </div>
               <div class="md-meta-item">
+                <span class="md-meta-label">分类</span>
+                <span class="md-meta-value">{{ displayCategory(m!.category) }}</span>
+              </div>
+              <div class="md-meta-item">
                 <span class="md-meta-label">大小</span>
                 <span class="md-meta-value">{{ formatSize(m!.size) }}</span>
+              </div>
+              <div class="md-meta-item">
+                <span class="md-meta-label">安装次数</span>
+                <span class="md-meta-value">{{ installCountText(m!.installCount) }}</span>
+              </div>
+              <div class="md-meta-item">
+                <span class="md-meta-label">作者</span>
+                <span class="md-meta-value">{{ m!.author || '—' }}</span>
               </div>
               <div v-if="m!.minAppVersion" class="md-meta-item">
                 <span class="md-meta-label">要求宿主</span>
                 <span class="md-meta-value">v{{ m!.minAppVersion }}+</span>
-              </div>
-              <div v-if="m!.author" class="md-meta-item">
-                <span class="md-meta-label">作者</span>
-                <span class="md-meta-value">{{ m!.author }}</span>
               </div>
             </div>
 
@@ -392,13 +409,35 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   min-width: 0;
 }
 .md-title-text .dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 0;
   font-size: 1.0625rem;
   font-weight: 700;
   color: var(--text-1);
-  white-space: nowrap;
+  overflow: hidden;
+}
+.dialog-title-text {
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 官方标识：与市场卡片同款填充药丸，标题旁一眼认出 */
+.md-official {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--brand-500);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1.4;
 }
 .md-version {
   font-size: 0.75rem;

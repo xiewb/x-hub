@@ -26,7 +26,7 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `entry` | `{ [surface]: string }` | 各形态入口，**值统一是 HTML 文件**（相对扩展目录） |
-| `icon` | string | 图标（相对路径，SVG 或 PNG） |
+| `icon` | string | 图标（相对路径，SVG 或 PNG）。**必须自带配色**：宿主经 `<img>` 渲染图标，SVG 的 `currentColor` 会回落为纯黑，暗色主题/壁纸态看不清——用「品牌色圆角方块底 + 白/浅色字形」或中高明度字形，别交付纯黑/纯白透明底图标（见 pitfalls 24） |
 | `minSize` | `{ w, h }` | window / drawer 建议尺寸 |
 | `description` | string | 一句话描述 |
 | `author` | string | 作者署名。市场卡片与详情页会展示它；没填会显示占位符「—」。发布弹窗里也能补填（会写回 manifest.json），但推荐生成时就填好 |

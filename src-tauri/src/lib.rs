@@ -1014,6 +1014,7 @@ pub fn run() {
             market::get_market_registry,
             market::refresh_market_registry,
             market::install_from_market,
+            market::report_market_install,
             market::install_local_archive,
             market::pack_extension_archive,
             market::update_extension,

@@ -462,6 +462,8 @@ export interface ExtensionEntry {
   description: string
   /** 作者署名（manifest.author；发布弹窗预填，市场卡片与详情页展示） */
   author: string | null
+  /** 分类（manifest.category；扩展中心分类筛选用，null = 归入「其他」） */
+  category: string | null
   /** 图标文件绝对路径（存在时才非空） */
   icon: string | null
   /** 扩展目录绝对路径 */
@@ -712,6 +714,14 @@ export interface MarketExtension {
   screenshots: string[]
   /** 该扩展申请的权限（发布时由服务端从 manifest 写入；老清单缺此字段 = 未提供） */
   permissions?: string[]
+  /** 分类（发布时作者自选、随 manifest 透传；老清单缺此字段 = 归入「其他」） */
+  category?: string
+  /** 官方扩展标记（平台官方自营账号发布时由服务端打上；老清单缺此字段，com.x-hub.* 前缀等价官方） */
+  official?: boolean
+  /** 安装次数（服务端下发清单时实时注入，按「机器 × 扩展」去重；老清单/本地缓存缺此字段 = 未知） */
+  installCount?: number
+  /** 本版本上架时间（ISO8601；市场「按发布时间」排序用，老条目缺此字段 = 排最旧） */
+  publishedAt?: string
 }
 
 /** 市场状态（get_market_registry / refresh_market_registry 返回） */
@@ -1541,6 +1551,7 @@ export const tauriApi = {
     screenshots?: string[],
     newVersion?: string,
     author?: string,
+    category?: string,
   ) =>
     invoke<SubmitResult>('dev_submit', {
       id,
@@ -1550,7 +1561,10 @@ export const tauriApi = {
       screenshots: screenshots && screenshots.length ? screenshots : null,
       newVersion: newVersion ?? null,
       author: author ?? null,
+      category: category ?? null,
     }),
+  /** 安装上报（前端装成后调用）：返回服务端是否新建了计数（true = 本次安装被计数，可就地 +1）；失败返回 false 不报错 */
+  reportMarketInstall: (id: string) => invoke<boolean>('report_market_install', { extId: id }),
   /** 读本地图片为 data URL（发布弹窗的截图缩略图预览用；作者选的图不在资产白名单目录里） */
   readImageDataUrl: (path: string) => invoke<string>('read_image_data_url', { path }),
   /**
