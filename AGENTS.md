@@ -279,7 +279,7 @@ x-hub/
 npm run dev           # Vite 开发服务器（浏览器预览 http://localhost:1420）
 npm run tauri:dev     # Tauri 开发窗口（需 Rust 工具链）
 npm run build         # vue-tsc 类型检查 + vite build
-npm run tauri:build   # 构建桌面应用（产物在 src-tauri/target/release/bundle/）
+npm run tauri:build   # 构建桌面应用（产物在 src-tauri/target/release/bundle/）；打包完成后自动触发 posttauri:build → scripts/clean-after-build.ps1 清理旧增量会话与旧 deps 产物（保留最新构建状态，不影响下次编译；依赖 cargo-sweep，未装时自动跳过 deps 裁剪）
 npm run tauri:test    # Rust 单元测试（Windows 必须走此包装脚本，见注意事项「cargo test」）
 ```
 
