@@ -45,11 +45,29 @@
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 | 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
+| 19 | 2026-10-15 | `4e511e8`→`501ad56` | v0.8.4 | 待提交 | 合并上游 v0.8.4（1 提交）：扩展中心三件套（分类/官方标识/安装次数）+ 列表改版（ec-mcard 卡片网格、可升级标签页、市场排序、自适应分页）、安装上报 install_mid + report_market_install、extensionMeta.ts 七类统一口径与单测、暗色灰阶提亮。零冲突；24 文件 +1072/-166 |
 | 18 | 2026-10-13 | `4808708`→`4e511e8` | v0.8.3 | 待提交 | 合并上游 v0.8.3（3 提交）：工作台日记模块、分屏预览改只读 Crepe 与整图位图复制、剪贴板纯文本提取（fragmentToPlainText）。冲突 3 文件：tauri.conf.json 保留 fork 全禁 CSP 改写（修订 #11 依据），NoteEditor 上游 buildCrepe/mountEditor 拆分结构 + fork CodeMirrorSource 三模式并集，Suda 双方新按钮并存 |
 | 17 | 2026-10-10 | `c462de9`→待提交 | v0.8.1 | 本条 | 速达新增浏览器标签页扫描导入（`scan_browser_tabs`）：Chromium 系（Chrome/Edge/Brave/Chromium/Tabbit）SNSS 会话解析（cmd6 导航/cmd25 tab→组/cmd27 组名）+ Firefox recovery.jsonlz4；分组归属三级兜底（cmd25→同步库 LevelDB 原始特征扫描→书签树前缀匹配，URL 规范化最长前缀）。修复：Sessions 路径（User Data\<profile>\Sessions 遍历全部 profile）、混合组名截断漏检（「垣信NMC」等 CJK+ASCII 组名整组丢失）、同 URL 全局去重吞掉已归组条目（改为归组条目优先保留） |
 | 16 | 2026-10-10 | `a85e1db`→`5ef829b` | v0.8.1 | 待提交 | 合并上游 v0.8.1（19 提交）：速记双链补全增强（键盘滚动/目录标注/全量渲染性能优化）、智能括号兼容中文输入法、标签索引方向修复；速达书签导入按浏览器分组勾选+网址去重开关、AccountBookmarks 账号书签扫描、打开文件所在位置 explorer /select 修复；主窗口去黑边、待办截止跨年补年份。零冲突，fork 特性无损 |
 | 15 | 2026-10-08 | `6e302db`→`a85e1db` | v0.8.0+ | 待提交 | 合并 v0.8.0 标签后上游 2 提交：CI 升级 GitHub Actions 到 Node 24 运行时（ci.yml/release.yml）、更新交流群二维码（② 群，新增 assets/wechat-group-qr.png）；纯 CI/文档变更零冲突，fork 特性无损 |
 | 14 | 2026-10-07 | `33bbcd2`→`6e302db` | v0.8.0 | 已提交 `7241450` | 合并上游 4 提交（速记大改造：文件夹树/回收站体系/双链/图片 GC/AI 美化/导入导出，日历待办横排 #30，速记树拖拽落点与 AI 整理丢图修复，CI 升 Node 24）；58 文件 +8079/-756。冲突 8 文件 23 块手工合并：回收站双实现归一（上游为主+fork 兼容层 soft_delete/list_trash/empty_trash），NoteEditor 双特性并集（fork 工具栏/查找替换/大纲/CodeMirror 源码模式 + 上游 AI 美化/双链面板/图片语法修复，textarea 触点适配 CM 实例 API），NoteList.vue 随上游删除（SpeednoteView 取代，fork 版留存于历史） |
+
+---
+
+### #19（2026-10-15）合并上游 v0.8.4：扩展中心三件套与列表改版
+
+**基点**：`4e511e8`→`501ad56`，merge-base 与上次合并点一致，无分叉；24 文件 +1072/-166。
+
+**上游内容清单**（v0.8.3..v0.8.4，共 1 提交）：
+- manifest 新增可选 category 字段，发布弹窗选分类经 set_category_in_dir 回写随包透传；市场清单新增 category/official/installCount/publishedAt（老清单缺省兼容）
+- 安装上报：install_mid 机器标识（数据根 install.mid，随机 32 hex）+ report_market_install 命令，前端装成后 counted 就地 +1、失败静默
+- 扩展中心改版：已安装列表 ec-mcard 卡片网格、新增「可升级」标签页、分类筛选三页共用（extensionMeta.ts 统一口径，固定七类）、市场排序与自适应分页（ResizeObserver）；发布配额挪入「我的扩展」
+- 官方标识徽标（卡片右上角缩小档）、详情弹窗同款药丸；暗色灰阶提亮一档（--text-3/--text-4）、侧栏位图扩展 logo 双极光晕
+- .gitignore 补 .tmp-extdiag/；版本号四处同步 0.8.4；新增 tests/extensionMeta.test.mjs
+
+**冲突解决**：零冲突，自动合并成功；fork 特性无损。
+
+**验证**：`npm run build` 通过；`cargo check` 通过；`cargo test note` 36 条全绿；`npm run tauri:build` release 编译成功，posttauri:build 清理脚本自动释放 3.95 GiB 旧增量会话与旧 deps 产物。
 
 ---
 
