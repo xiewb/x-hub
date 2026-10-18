@@ -23,7 +23,7 @@ description: "Generate an x-hub extension (扩展 / 插件): manifest.json + ent
 | `references/bridge-api.md` | 要用宿主数据 / 存储 / 配置 / 事件 / 导出文件时——**先确认 API 是否存在、要什么权限** |
 | `references/theming.md` | **写任何 CSS 之前**——变量表、壁纸态、双声明 fallback |
 | `references/surfaces.md` | 定形态、或写 `module` 多形态入口时 |
-| `references/service.md` | 扩展带 Node 后端时 |
+| `references/service.md` | 扩展带 Node 后端时；要在 manifest 里声明 `agent.tools` 给内置 AI 助手调用时也读这里的「AI 工具端点」节 |
 | `references/convert-html.md` | 改造现成网页时——去 CDN / 主题映射 / 存储迁移 |
 | `references/debug-deploy.md` | 代码写完要跑起来、报交付清单、用户提到发布上架时 |
 | `references/pitfalls.md` | 写代码前扫一眼、交付前逐条对一遍（24 条实机踩坑） |

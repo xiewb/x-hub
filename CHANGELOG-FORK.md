@@ -45,6 +45,7 @@
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 | 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
+| 20 | 2026-10-19 | `501ad56`→`4b3ba34` | v0.9.0 | 待提交 | 合并上游 v0.9.0（7 提交）：Agent 底座（31 内置工具/权限三档/turn 循环）、扩展工具 manifest 自描述 + extension_tool_list/call 聚合转发、AI 助手独立设置大类、TODO 范围档计数药丸与日历溢出折叠、反谎报铁律。零冲突；53 文件 +7978/-538 |
 | 19 | 2026-10-15 | `4e511e8`→`501ad56` | v0.8.4 | 待提交 | 合并上游 v0.8.4（1 提交）：扩展中心三件套（分类/官方标识/安装次数）+ 列表改版（ec-mcard 卡片网格、可升级标签页、市场排序、自适应分页）、安装上报 install_mid + report_market_install、extensionMeta.ts 七类统一口径与单测、暗色灰阶提亮。零冲突；24 文件 +1072/-166 |
 | 18 | 2026-10-13 | `4808708`→`4e511e8` | v0.8.3 | 待提交 | 合并上游 v0.8.3（3 提交）：工作台日记模块、分屏预览改只读 Crepe 与整图位图复制、剪贴板纯文本提取（fragmentToPlainText）。冲突 3 文件：tauri.conf.json 保留 fork 全禁 CSP 改写（修订 #11 依据），NoteEditor 上游 buildCrepe/mountEditor 拆分结构 + fork CodeMirrorSource 三模式并集，Suda 双方新按钮并存 |
 | 17 | 2026-10-10 | `c462de9`→待提交 | v0.8.1 | 本条 | 速达新增浏览器标签页扫描导入（`scan_browser_tabs`）：Chromium 系（Chrome/Edge/Brave/Chromium/Tabbit）SNSS 会话解析（cmd6 导航/cmd25 tab→组/cmd27 组名）+ Firefox recovery.jsonlz4；分组归属三级兜底（cmd25→同步库 LevelDB 原始特征扫描→书签树前缀匹配，URL 规范化最长前缀）。修复：Sessions 路径（User Data\<profile>\Sessions 遍历全部 profile）、混合组名截断漏检（「垣信NMC」等 CJK+ASCII 组名整组丢失）、同 URL 全局去重吞掉已归组条目（改为归组条目优先保留） |
@@ -68,6 +69,23 @@
 **冲突解决**：零冲突，自动合并成功；fork 特性无损。
 
 **验证**：`npm run build` 通过；`cargo check` 通过；`cargo test note` 36 条全绿；`npm run tauri:build` release 编译成功，posttauri:build 清理脚本自动释放 3.95 GiB 旧增量会话与旧 deps 产物。
+
+---
+
+### #20（2026-10-19）合并上游 v0.9.0：Agent 底座与 AI 助手工具扩展
+
+**基点**：`501ad56`→`4b3ba34`，merge-base 与上次合并点一致，无分叉；53 文件 +7978/-538。
+
+**上游内容清单**（v0.8.4..v0.9.0，共 7 提交）：
+- Agent 底座上线：Rust 侧新增 `agent/` 模块（builtin 31 内置工具、权限三档、turn 循环、审批流 approval），AI 助手可操作全应用
+- 扩展工具暴露：manifest 自描述扩展工具，`extension_tool_list/call` 聚合转发（ext_tools.rs）
+- 设置重构：AI 助手独立成设置大类（助手/面板/额度/供应商，新增 settings/AiPanel.vue），对话面板消息复制钮
+- TODO 增强：范围档计数药丸 + 日历格溢出折叠，标签筛选行上移贴列表
+- 可靠性：反谎报铁律入提示词 + 全链路留痕；会话删除取消回合等六项审查修复；新增 get_snippet 读工具
+
+**冲突解决**：零冲突，自动合并成功；fork 特性无损。
+
+**验证**：`npm run build` 通过（vue-tsc + vite，仅一条无害的 INEFFECTIVE_DYNAMIC_IMPORT 警告）；`cargo check` 通过；`cargo test note` 41 条全绿。
 
 ---
 

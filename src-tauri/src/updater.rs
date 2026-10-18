@@ -899,6 +899,12 @@ pub fn apply_pending_update(app: &tauri::AppHandle, current_version: &str) {
 ///   窗口」，两者都没了之后再手动开一个实例不会被拦截——出现双实例（明确不接受）。
 ///   所以失败路径绝不触碰 destroy，本进程仍是受保护的唯一主实例。
 pub fn relaunch_app(app: &tauri::AppHandle, strip_hidden_arg: bool) {
+    // 重启前补一次窗口几何保存：relaunch 走 std::process::exit(0) 硬退，不触发
+    // CloseRequested（此前唯一的保存时机）——长期驻留副屏、从不点 × 的用户，
+    // config 里存的还是很久以前的坐标，升级/重启后窗口被恢复回老位置（主屏）。
+    // 启动早期 apply_pending_update 路径窗口尚未显示，persist 内部 is_visible
+    // 守卫直接跳过，不会用默认几何覆盖好数据。
+    crate::persist_window_state(app);
     // 直接 exit(0) 不会触发 RunEvent::Exit，service 后端子进程需在此手动停掉，
     // 否则 Node 子进程残留（标准退出路径由 lib.rs RunEvent::Exit → stop_all 兜底）。
     // setup 早期（apply_pending_update 路径）ServiceState 尚未 manage：try_state 判空跳过。

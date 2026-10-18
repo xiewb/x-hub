@@ -66,6 +66,13 @@ pub fn get_initial_data(state: State<'_, DbState>) -> Result<InitialData, String
     })
 }
 
+/// 速达资源全量清单（resources-changed 刷新用；agent 工具改库后前端重拉此命令）
+#[tauri::command]
+pub fn list_resources(state: State<'_, DbState>) -> Result<Vec<crate::models::Resource>, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    resource::list_all(&conn).map_err(err_str)
+}
+
 #[derive(serde::Serialize)]
 pub struct InitialData {
     pub resources: Vec<Resource>,
@@ -4495,11 +4502,20 @@ pub fn create_chat_session(
     Ok(s)
 }
 
-/// 删除会话（级联删除消息）
+/// 删除会话（级联删除消息；同时清掉该会话的「本会话允许」授权，防残留语义直跑）
 #[tauri::command]
-pub fn delete_chat_session(state: State<'_, DbState>, id: i64) -> Result<(), String> {
+pub fn delete_chat_session(
+    state: State<'_, DbState>,
+    agent: State<'_, std::sync::Arc<crate::agent::state::AgentState>>,
+    id: i64,
+) -> Result<(), String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     chat::delete_session(&conn, id).map_err(err_str)?;
+    drop(conn);
+    // 会话删了，其进行中的 agent 回合也要中断：不取消会继续烧模型调用，
+    // 收尾写入还会因外键级联（消息已随会话清掉）而报错（0.9.0 审查优化）
+    agent.cancel_session_turns(id);
+    agent.clear_session(id);
     log::info!("删除对话会话: id={}", id);
     Ok(())
 }
@@ -4842,7 +4858,11 @@ pub async fn send_chat_message(
     //    避免历史越长发送越慢、内存按全量历史成倍膨胀）
     let history = {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
-        chat::list_recent_messages(&conn, session_id, CHAT_CONTEXT_WINDOW).map_err(err_str)?
+        // 截断边界可能落在 agent 回合中间：头部孤儿 tool 消息会被上游 400，先剪掉
+        //（这里的 chat 是 repo::chat；剪裁助手在 crate::chat）
+        crate::chat::trim_leading_orphan_tools(
+            chat::list_recent_messages(&conn, session_id, CHAT_CONTEXT_WINDOW).map_err(err_str)?,
+        )
     };
 
     // 4) 解析模型配置：平台额度走「一个入口 + 多模型负载切换」，自备供应商精确命中（见 pick_chat_model）
@@ -4861,13 +4881,21 @@ pub async fn send_chat_message(
 
     let chunk_sender = on_event.clone();
     let started = std::time::Instant::now();
-    let result = crate::chat::stream_chat(&model, &history, &mut reply, |delta| {
-        chunk_sender
-            .send(crate::chat::ChatStreamEvent::Chunk {
-                content: delta,
-            })
-            .map_err(|e| e.to_string())
-    })
+    // turn_id：本轮用户消息的 turn（#t42 生成）；平台链路以 X-XHub-Turn-Id 透传给服务端对账（§8）
+    let result = crate::chat::stream_chat_ex(
+        &model,
+        &history,
+        None,
+        user_msg.turn_id.as_deref(),
+        &mut reply,
+        |delta| {
+            chunk_sender
+                .send(crate::chat::ChatStreamEvent::Chunk {
+                    content: delta,
+                })
+                .map_err(|e| e.to_string())
+        },
+    )
     .await;
     let elapsed_ms = started.elapsed().as_millis() as i64;
 
@@ -4876,7 +4904,7 @@ pub async fn send_chat_message(
             if reply.trim().is_empty() {
                 send_error = Some("模型未返回任何内容".to_string());
             } else {
-                usage = Some(u);
+                usage = Some(u.usage);
             }
         }
         Err(e) => send_error = Some(e),
@@ -4934,6 +4962,349 @@ pub async fn send_chat_message(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Agent 模式（#t44，计划 §4）：带工具循环的对话
+// ---------------------------------------------------------------------------
+
+/// 模型调用实现体：包 `chat::stream_chat_ex`，增量经 Channel 推 Chunk；
+/// 每次回调前检查中断旗标（用户取消 → 掐断上游流）。
+struct AgentStreamInvoke {
+    model: crate::models::ChatModelConfig,
+    turn_id: String,
+    ch: tauri::ipc::Channel<crate::chat::ChatStreamEvent>,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::agent::turn::ModelInvoke for AgentStreamInvoke {
+    fn invoke<'a>(
+        &mut self,
+        msgs: Vec<crate::models::ChatMessage>,
+        tools: Option<Vec<serde_json::Value>>,
+        _cb: crate::agent::turn::ChunkCb<'a>,
+    ) -> crate::agent::turn::InvokeFuture<'a> {
+        let model = self.model.clone();
+        let turn_id = self.turn_id.clone();
+        let ch = self.ch.clone();
+        let flag = self.flag.clone();
+        Box::pin(async move {
+            let mut buf = String::new();
+            let cancelled = flag.clone();
+            let mut fwd = |delta: String| -> Result<(), String> {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("已中断".into());
+                }
+                ch.send(crate::chat::ChatStreamEvent::Chunk { content: delta })
+                    .map_err(|e| e.to_string())
+            };
+            let res = crate::chat::stream_chat_ex_with_cancel(
+                &model,
+                &msgs,
+                tools.as_deref(),
+                Some(&turn_id),
+                Some(flag.clone()),
+                &mut buf,
+                &mut fwd,
+            )
+            .await?;
+            Ok(crate::agent::turn::RoundOutput {
+                content: buf,
+                usage: res.usage,
+                tool_calls: res.tool_calls,
+            })
+        })
+    }
+}
+
+/// 审批实现体：挂 oneshot 等前端 `respond_agent_approval` 回答；
+/// 前端关窗/超时未答（接收端 Err）→ 按拒绝处理，宁严勿宽。
+/// 0.9.0 修复：等待期间同时轮询中断旗标——用户点「停止」能立刻结束等待；
+/// 否则 Ask 档在无人应答时会把回合挂死（审批卡丢失/前端异常后循环永不退出）。
+struct OneshotApprover {
+    state: std::sync::Arc<crate::agent::state::AgentState>,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::agent::turn::Approver for OneshotApprover {
+    fn approve(&mut self, ask: crate::agent::turn::ApprovalAsk) -> crate::agent::turn::ApproveFuture {
+        let st = self.state.clone();
+        let flag = self.flag.clone();
+        Box::pin(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            st.open_approval(ask, tx);
+            // 每 200ms 查一次中断旗标；中断 = 按拒绝收尾，循环随后的检查点会结束回合
+            async fn cancelled(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+                loop {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            tokio::select! {
+                r = rx => match r {
+                    Ok(a) => a,
+                    Err(_) => crate::agent::approval::ApproveAnswer::Denied,
+                },
+                _ = cancelled(flag) => crate::agent::approval::ApproveAnswer::Denied,
+            }
+        })
+    }
+}
+
+/// Agent 模式发消息：带工具循环的对话（计划 §4）。
+/// 与 `send_chat_message` 的区别：下发权限档过滤后的工具清单，模型发起工具调用时
+/// 循环执行（Ask 档先经前端内联确认），过程事件（ToolCall/ToolResult/ApprovalRequest）
+/// 与最终 TurnDone 一并推给前端渲染（工具卡片/时间线 UI 在 #t46）。
+#[tauri::command]
+pub async fn send_agent_message(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    agent: State<'_, std::sync::Arc<crate::agent::state::AgentState>>,
+    session_id: i64,
+    content: String,
+    // 对话框快捷切换的权限档（readonly/ask/full）；缺省回落配置（#t47 接 AppConfig，当前默认 ask）
+    permission_mode: Option<String>,
+    on_event: tauri::ipc::Channel<crate::chat::ChatStreamEvent>,
+) -> Result<(), String> {
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err("消息不能为空".into());
+    }
+    let started = std::time::Instant::now();
+
+    // 1) 会话 + 用户消息落库（自动标题 / touch 与普通对话同一套）
+    let session = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        chat::get_session(&conn, session_id).map_err(err_str)?
+    };
+    let user_msg = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let m = chat::add_message(&conn, session_id, "user", &content).map_err(err_str)?;
+        let _ = chat::touch_session(&conn, session_id);
+        if session.title == "新对话" {
+            let title = auto_chat_title(&content);
+            let _ = chat::rename_session(&conn, session_id, &title);
+        }
+        m
+    };
+    // user 消息落库时一定生成了 turn_id；兜底以防历史数据/未来改动破坏该约定
+    let turn_id = user_msg
+        .turn_id
+        .clone()
+        .unwrap_or_else(|| format!("turn_{}", chrono::Utc::now().timestamp_micros()));
+
+    // 2) 模型配置 + 权限档：对话框快捷切换优先；未传时读持久默认档（非法值回落安全默认 ask）
+    let cfg = config::load();
+    let model = pick_chat_model(&cfg.chat_models, &session.model_name)?;
+    let mode = permission_mode
+        .as_deref()
+        .and_then(crate::agent::approval::PermissionMode::from_param)
+        .or_else(|| crate::agent::approval::PermissionMode::from_param(&cfg.agent_permission_mode))
+        .unwrap_or(crate::agent::approval::DEFAULT_PERMISSION_MODE);
+    let prompt_on_dangerous = cfg.agent_prompt_on_dangerous;
+
+    // 3) 上下文：system prompt（四段：身份/时间/准则/关于我——档案为空时该段省略）+ 按 turn 截断历史
+    let about_me = Some(cfg.agent_about_me.as_str()).filter(|s| !s.trim().is_empty());
+    let system_prompt = crate::agent::prompt::build_system_prompt(chrono::Local::now(), about_me);
+    let history = {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        crate::agent::context::build_context(&conn, session_id).map_err(err_str)?
+    };
+
+    // 4) 运行时：中断旗标 + 三个实现体（模型调用 / 审批 / 事件转发）
+    // 开工即告知前端 turn_id：停止键立刻可用（不必等首个工具事件才知道 id）。
+    // 先发再登记：发送失败（前端窗口已销毁）直接早退——若先 register_turn 再失败，
+    // cancels 登记无人清理（turn_id 每条消息唯一，慢泄漏只增不减）
+    on_event
+        .send(crate::chat::ChatStreamEvent::TurnStart { turn_id: turn_id.clone() })
+        .map_err(|e| e.to_string())?;
+    let cancel_flag = agent.register_turn(session_id, &turn_id);
+    let mut invoke = AgentStreamInvoke {
+        model: model.clone(),
+        turn_id: turn_id.clone(),
+        ch: on_event.clone(),
+        flag: cancel_flag.clone(),
+    };
+    let mut approver = OneshotApprover { state: agent.inner().clone(), flag: cancel_flag.clone() };
+    let ev = on_event.clone();
+    // 错误/中断收尾的 partial：顺手记录已流出的增量（封顶防无界）——正文本体在
+    // invoke 内部的 buffer 里，这里不记的话 Error 事件的 partial 永远是空串
+    let partial_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let pb = partial_buf.clone();
+    let emit = move |e: crate::chat::ChatStreamEvent| {
+        if let crate::chat::ChatStreamEvent::Chunk { content } = &e {
+            if let Ok(mut b) = pb.lock() {
+                if b.len() < 20_000 {
+                    b.push_str(content);
+                }
+            }
+        }
+        ev.send(e).map_err(|x| x.to_string())
+    };
+    let f2 = cancel_flag.clone();
+    let is_cancelled = move || f2.load(std::sync::atomic::Ordering::Relaxed);
+
+    // 5) 循环（grants 用快照：0.9.0 修复——原先 tokio 锁跨整个回合 await 持有，
+    // Ask 档等确认期间其它回合会全部卡死在取锁上；现在各回合在副本上判定，结束并回）
+    let mut grants = agent.grants_snapshot();
+    let result = crate::agent::turn::run_agent_turn(
+        session_id,
+        &turn_id,
+        mode,
+        &mut grants,
+        prompt_on_dangerous, // 完全权限档下危险操作仍提示（子开关，设置里可开）
+        crate::agent::tools::global(),
+        &system_prompt,
+        history,
+        crate::agent::turn::MAX_ROUNDS,
+        &mut invoke,
+        &mut approver,
+        emit,
+        is_cancelled,
+        || crate::db::open_tool_connection().map_err(|e| e.to_string()),
+    )
+    .await;
+    agent.grants_merge(&grants);
+    agent.finish_turn(&turn_id);
+
+    // 6) 落库（pending 顺序即发生顺序）+ 用量累加 + 收尾事件
+    // 工具改过的数据域广播刷新事件（0.9.0 修复：agent 建的待办/笔记此前
+    // 不触发任何刷新事件，界面上「显示成功但看不到数据」）。事件名与
+    // UI 命令一致（todos-changed 等），各窗口界面统一刷新。
+    // Ok/Err 两条出口都要广播：真错误（模型调用断掉等）发生前工具可能已经写过库，
+    // 只在成功路径广播会漏掉这批写入——待办已建、界面却再也不刷新。
+    let broadcast_domains = |domains: &std::collections::BTreeSet<String>| {
+        for domain in domains {
+            let event = match domain.as_str() {
+                "todos" => Some(("todos-changed", Some("todo-tags-changed"))),
+                "notes" => Some(("notes-changed", None)),
+                "snippets" => Some(("snippets-changed", None)),
+                "stickies" => Some(("stickies-changed", None)),
+                "countdowns" => Some(("countdowns-changed", None)),
+                "resources" => Some(("resources-changed", None)),
+                _ => None,
+            };
+            if let Some((primary, secondary)) = event {
+                let _ = app.emit(primary, ());
+                if let Some(sec) = secondary {
+                    let _ = app.emit(sec, ());
+                }
+            }
+        }
+    };
+    match result {
+        Ok(art) => {
+            let usage = art.usage;
+            let tool_count = art.tool_count;
+            broadcast_domains(&art.domains);
+            let mut last: Option<crate::models::ChatMessage> = None;
+            {
+                let conn = state.0.lock().map_err(|e| e.to_string())?;
+                for p in &art.pending {
+                    last = Some(
+                        chat::add_message_ex(
+                            &conn,
+                            session_id,
+                            Some(&turn_id),
+                            &p.role,
+                            &p.content,
+                            p.tool_calls.as_deref(),
+                            p.tool_call_id.as_deref(),
+                            p.tool_name.as_deref(),
+                            p.tool_status.as_deref(),
+                        )
+                        .map_err(err_str)?,
+                    );
+                }
+                let _ = chat::add_session_usage(
+                    &conn,
+                    session_id,
+                    usage.input,
+                    usage.output,
+                    usage.cache_read,
+                    usage.reasoning,
+                    started.elapsed().as_millis() as i64,
+                );
+                let _ = chat::touch_session(&conn, session_id);
+            }
+            let conn = state.0.lock().map_err(|e| e.to_string())?;
+            let updated = chat::get_session(&conn, session_id).map_err(err_str)?;
+            drop(conn);
+            match last {
+                Some(message) => on_event
+                    .send(crate::chat::ChatStreamEvent::TurnDone {
+                        turn_id,
+                        message,
+                        session: updated,
+                        usage,
+                        tool_count,
+                    })
+                    .map_err(|e| e.to_string())?,
+                // 中断发生在任何轮次完成之前：无内容可落库，按错误收尾（前端保留已流出部分）
+                None => on_event
+                    .send(crate::chat::ChatStreamEvent::Error {
+                        message: "已中断".into(),
+                        partial: partial_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+                    })
+                    .map_err(|e| e.to_string())?,
+            }
+        }
+        Err((e, art)) => {
+            // 已执行的写入照常广播刷新（见 broadcast_domains 注释）；过程消息按既有口径不落库
+            broadcast_domains(&art.domains);
+            on_event
+                .send(crate::chat::ChatStreamEvent::Error {
+                    message: e,
+                    partial: partial_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+                })
+                .map_err(|e2| e2.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// 前端回答工具审批（Ask 档内联卡片）：once 本次允许 / always 本会话内允许 / 其他一律拒绝。
+/// turn_id 用于并发回合同 call_id 撞车时精确路由（兼容后端会跨请求复用 call_0 这类 id）
+#[tauri::command]
+pub async fn respond_agent_approval(
+    agent: State<'_, std::sync::Arc<crate::agent::state::AgentState>>,
+    turn_id: String,
+    call_id: String,
+    answer: String,
+) -> Result<(), String> {
+    log::info!("[agent] 收到审批答复: {turn_id}/{call_id} answer={answer}");
+    let ans = crate::agent::approval::ApproveAnswer::from_param(&answer);
+    if agent.answer_approval(turn_id.trim(), &call_id, ans) {
+        Ok(())
+    } else {
+        // 0.9.0 修复：区分「已被处理/已失效」。点停止或回合已结束都会清掉挂起的确认，
+        // 这时回答会落空——提示用户该回合的状态而不是含糊报错。
+        Err("该确认已失效（可能已停止或已处理），如界面仍卡住请点停止结束该回合".into())
+    }
+}
+
+/// 查询某会话仍在等待确认的审批（Ask 档）：面板重开/切回会话时还原 awaiting 卡片。
+/// 挂起审批不落库、只存内存（§4），这里给只读快照；答复仍走 `respond_agent_approval`。
+#[tauri::command]
+pub fn list_agent_approvals(
+    agent: State<'_, std::sync::Arc<crate::agent::state::AgentState>>,
+    session_id: i64,
+) -> Result<Vec<crate::agent::turn::ApprovalAsk>, String> {
+    Ok(agent.pending_approvals(session_id))
+}
+
+/// 用户中断 Agent 回合：置旗标（流式回调与循环检查点都会看到）。
+/// 已执行的写操作不回滚（§4）；循环收尾后由 send_agent_message 完成落库与事件。
+#[tauri::command]
+pub async fn cancel_agent_turn(
+    agent: State<'_, std::sync::Arc<crate::agent::state::AgentState>>,
+    turn_id: String,
+) -> Result<(), String> {
+    agent.cancel_turn(&turn_id);
+    Ok(())
+}
+
 /// 笔记 AI 深度整理：把笔记全文交给对话模型做一次**无会话**的语义重排（分组/标题/清单）。
 /// 与 `send_chat_message` 的区别：不建会话、不落库、不出现在聊天记录里；模型解析**优先平台内置
 /// 额度**（用户明确要求：有平台条目且已登录就固定走平台入口轮询），未登录/未开启平台时回退
@@ -4981,8 +5352,13 @@ pub async fn ai_transform_note(
     let message = crate::models::ChatMessage {
         id: 0,
         session_id: 0,
+        turn_id: None,
         role: "user".into(),
         content: format!("{instruction}\n\n---\n\n{content}"),
+        tool_calls: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_status: None,
         created_at: String::new(),
     };
 

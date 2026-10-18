@@ -104,6 +104,21 @@ function runtimeLabel(runtime: 'web' | 'service'): string {
   return runtime === 'service' ? 'service（含本地后端进程）' : 'web（纯前端）'
 }
 
+// ---- AI 助手：manifest.agent.tools 声明的工具 + 每扩展授权（缺省允许） ----
+const agentTools = computed(() => ext.value?.agent_tools ?? [])
+const agentGranted = computed(() =>
+  ext.value ? store.state.config.agent_ext_tool_grants?.[ext.value.id] ?? true : true,
+)
+
+function agentLevelLabel(level: 'read' | 'write' | 'dangerous'): string {
+  return level === 'write' ? '写' : level === 'dangerous' ? '危险' : '读'
+}
+
+function toggleAgentGrant() {
+  if (!ext.value) return
+  store.setExtensionAgentGrant(ext.value.id, !agentGranted.value)
+}
+
 const store = useStore()
 
 // 固定到侧栏：点击左栏菜单即在主区打开该扩展（view 形态）
@@ -267,6 +282,38 @@ async function confirmUninstall() {
                 </div>
               </div>
               <p v-else class="es-empty">无权限申请</p>
+            </section>
+
+            <!-- AI 助手：manifest.agent.tools 声明的工具展示 + 每扩展授权开关。
+                 声明了工具才渲染整块（web 扩展一期不支持声明，永远看不到这块） -->
+            <section v-if="!ext.invalid && agentTools.length > 0" class="es-block">
+              <h3 class="es-block-title">AI 助手</h3>
+              <p class="es-empty es-agent-hint">
+                本扩展向 AI 助手声明了 {{ agentTools.length }} 个工具；AI 调用时按各工具声明的档位受同一套审批约束（写/危险操作会先征求你的确认）。
+              </p>
+              <ul class="es-agent-tools">
+                <li v-for="t in agentTools" :key="t.name" class="es-agent-tool">
+                  <span class="es-agent-level" :class="`lv-${t.level}`">{{ agentLevelLabel(t.level) }}</span>
+                  <span class="es-agent-body">
+                    <span class="es-agent-name">{{ t.name }}</span>
+                    <span class="es-agent-desc">{{ t.description }}</span>
+                  </span>
+                </li>
+              </ul>
+              <div class="es-perm-row">
+                <span class="es-setting-name">允许 AI 助手调用本扩展的工具</span>
+                <button
+                  class="toggle"
+                  role="switch"
+                  type="button"
+                  :aria-checked="agentGranted"
+                  :class="{ on: agentGranted }"
+                  @click="toggleAgentGrant"
+                >
+                  <span class="toggle-knob"></span>
+                </button>
+              </div>
+              <p class="es-empty es-openmode-hint">关闭后本扩展声明的工具不再出现在 AI 助手可调用清单里（对话进行中已获会话授权的调用不受影响）。</p>
             </section>
 
             <section v-if="!ext.invalid" class="es-block">
@@ -539,6 +586,59 @@ async function confirmUninstall() {
   font-size: 0.8125rem;
   color: var(--text-1);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.es-agent-hint {
+  padding: 2px 0 6px;
+}
+.es-agent-tools {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.es-agent-tool {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.es-agent-level {
+  flex-shrink: 0;
+  margin-top: 1px;
+  font-size: 0.6875rem;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: var(--radius-pill);
+  font-weight: 600;
+}
+.es-agent-level.lv-read {
+  color: var(--c-green-ink);
+  background: var(--c-green-soft);
+}
+.es-agent-level.lv-write {
+  color: var(--c-orange-ink);
+  background: var(--c-orange-soft);
+}
+.es-agent-level.lv-dangerous {
+  color: var(--c-red-ink);
+  background: var(--c-red-soft);
+}
+.es-agent-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.es-agent-name {
+  font-size: 0.8125rem;
+  color: var(--text-1);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.es-agent-desc {
+  font-size: 0.75rem;
+  color: var(--text-3);
+  line-height: 1.45;
 }
 .toggle {
   flex-shrink: 0;

@@ -509,9 +509,10 @@ onMounted(async () => {
         void onCreateNote()
       }
     })
-    // 独立对话窗「模型设置」入口：唤出主窗并定位到设置 → AI 助手
-    unlistenOpenChatSettings = await on('open-chat-settings', () => {
-      onOpenChatSettings()
+    // 独立对话窗「模型设置/去兑换」入口：唤出主窗并定位到设置页（载荷 = ai / account 分类）
+    unlistenOpenChatSettings = await on('open-chat-settings', (e) => {
+      if (e.payload === 'account') onOpenAccountSettings()
+      else onOpenChatSettings()
     })
     // 搜索快捷键（全局注册，Rust 分发）：主窗前端负责打开/关闭搜索弹窗
     unlistenSearchShortcut = await on('search-shortcut', () => {
@@ -674,9 +675,16 @@ function onChatToggle() {
   toggleChat()
 }
 
-// 面板「去配置大模型」：跳转设置页并定位到 AI 助手分类
+// 面板「去配置大模型 / 模型设置」：跳转设置页并定位到 AI 助手 → 供应商子项
 function onOpenChatSettings() {
-  settingsSection.value = 'ai'
+  settingsSection.value = 'providers'
+  if (chatOpen.value) toggleChat()
+  activeView.value = 'settings'
+}
+
+// 面板积分徽标 / 「积分不足」卡片的「去兑换」：跳转设置页并定位到账号分类
+function onOpenAccountSettings() {
+  settingsSection.value = 'account'
   if (chatOpen.value) toggleChat()
   activeView.value = 'settings'
 }
@@ -1029,6 +1037,7 @@ provide('showToast', showToast)
               :side="chatSide"
               @toggle="onChatToggle"
               @open-model-settings="onOpenChatSettings"
+              @open-account-settings="onOpenAccountSettings"
               @resized="onChatPanelResized"
             />
           </div>

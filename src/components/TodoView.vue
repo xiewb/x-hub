@@ -72,11 +72,28 @@ const allTags = computed(() => store.state.todoTags)
 /** 未完成 + 已完成分开：视图默认只看未完成（已完成走列表底部折叠区） */
 const showDone = ref(false)
 
-function hasTag(t: Todo): boolean {
+/** 标签命中（OR 语义：选中多个标签时任一命中即显示）。tagFilter 为空 = 不过滤。
+ *  列表、日历真实条目、周期虚拟实例共用同一判定，保证两侧口径一致 */
+function hasAnyTag(id: number): boolean {
   if (!tagFilter.value.length) return true
-  const ids = store.todoTagIds(t.id)
-  return tagFilter.value.some((id) => ids.includes(id))
+  const ids = store.todoTagIds(id)
+  return tagFilter.value.some((tid) => ids.includes(tid))
 }
+
+function hasTag(t: Todo): boolean {
+  return hasAnyTag(t.id)
+}
+
+/** 每个标签挂着的未完成待办数：chip 上直接给计数，让「点标签 = 查待办」这件事
+ *  一眼可见（此前 chips 太像纯展示徽标，过滤能力没有被发现） */
+const tagCounts = computed(() => {
+  const map = new Map<number, number>()
+  for (const t of topTodos.value) {
+    if (t.done) continue
+    for (const id of store.todoTagIds(t.id)) map.set(id, (map.get(id) ?? 0) + 1)
+  }
+  return map
+})
 
 const topTodos = computed(() =>
   store.state.todos.filter((t) => t.parent_id == null),
@@ -85,6 +102,20 @@ const topTodos = computed(() =>
 const visible = computed(() =>
   topTodos.value.filter((t) => (showDone.value ? t.done : !t.done) && hasTag(t) && (showDone.value || inHorizon(t, horizon.value, today.value))),
 )
+
+/** 各范围档的命中数（与 visible 同一过滤基底，只换范围档）。范围切换只影响「未来日期」
+ *  的条目——置顶/逾期/无截止在任何范围下都常显（inHorizon 的既定口径），待办多是这几类时
+ *  列表肉眼无变化，容易被当成「切了没反应」；按钮上直接给计数，让筛选生效看得见 */
+const horizonCounts = computed(() => {
+  const map = new Map<Horizon, number>()
+  for (const h of HORIZONS) {
+    map.set(
+      h.key,
+      topTodos.value.filter((t) => (showDone.value ? t.done : !t.done) && hasTag(t) && (showDone.value || inHorizon(t, h.key, today.value))).length,
+    )
+  }
+  return map
+})
 
 /** 分组：置顶 → 逾期 → 今天 → 本周 → 本月 → 以后 → 无日期（组内按手动排序/创建时间） */
 const groups = computed(() => {
@@ -114,6 +145,8 @@ const kidsOf = computed(() => {
 const realByDay = computed(() => {
   const map = new Map<string, Todo[]>()
   for (const t of topTodos.value) {
+    // 与左侧列表同一标签过滤口径：筛选激活时日历也只显示命中条目
+    if (!hasTag(t)) continue
     const at = t.due_at ?? (t.done ? parseServerDate(t.completed_at)?.getTime() ?? null : null)
     if (at == null) continue
     const key = isoKey(new Date(at))
@@ -139,6 +172,8 @@ const overdueByDay = computed(() => {
 const virtualByDay = computed(() => {
   const map = new Map<string, TodoOccurrence[]>()
   for (const o of occurrences.value) {
+    // 周期实例跟着其本体条目的标签走（todo_id → 本体标签命中判定）
+    if (!hasAnyTag(o.todo_id)) continue
     const key = isoKey(new Date(o.at_ms))
     const list = map.get(key)
     if (list) list.push(o)
@@ -152,6 +187,23 @@ const titleOf = computed(() => {
   for (const t of store.state.todos) map.set(t.id, t.title)
   return map
 })
+
+/** 日历格内最多直接展示的条数：其余折叠成「…+N」——一格塞十来条会把月历撑爆，
+ *  完整清单看格子下方的「当天明细」（点格子即达） */
+const CELL_MAX_CHIPS = 2
+
+/** 某个日期格要渲染的 chips：真实条目优先、周期虚拟实例补位，剩余计进折叠口 */
+function chipsOf(key: string) {
+  const real = realByDay.value.get(key) ?? []
+  const virtual = virtualByDay.value.get(key) ?? []
+  const shownReal = real.slice(0, CELL_MAX_CHIPS)
+  const shownVirtual = virtual.slice(0, CELL_MAX_CHIPS - shownReal.length)
+  return {
+    real: shownReal,
+    virtual: shownVirtual,
+    extra: real.length + virtual.length - shownReal.length - shownVirtual.length,
+  }
+}
 
 /** 右侧日历下方「选中那天」的待办清单：点格子切换（默认今天），未完成在前、已完成在后 */
 const selectedDay = ref(isoKey(new Date()))
@@ -463,19 +515,6 @@ function onVirtualDown(e: PointerEvent) {
             <h2>待办</h2>
           </div>
           <span class="tv-spacer"></span>
-          <div class="tv-tags">
-            <button
-              v-for="tag in allTags"
-              :key="tag.id"
-              type="button"
-              class="tv-tagchip"
-              :class="{ on: tagFilter.includes(tag.id) }"
-              @click="toggleTagFilter(tag.id)"
-            >
-              <i class="dot" :style="{ background: tag.color || 'var(--brand-500)' }"></i>{{ tag.name }}
-              <span class="x" title="删除该标签" @click.stop="removingTag = tag"><X :size="10" :stroke-width="2.5" /></span>
-            </button>
-          </div>
           <button type="button" class="tv-primary" @click="openNew()">
             <Plus :size="14" :stroke-width="2.2" />新建待办
           </button>
@@ -491,7 +530,7 @@ function onVirtualDown(e: PointerEvent) {
               :class="{ on: horizon === h.key }"
               @click="horizon = h.key"
             >
-              {{ h.label }}
+              {{ h.label }} <span class="cnt">{{ horizonCounts.get(h.key) ?? 0 }}</span>
             </button>
           </div>
           <span class="tv-spacer"></span>
@@ -504,8 +543,38 @@ function onVirtualDown(e: PointerEvent) {
           </div>
         </div>
 
+        <!-- 标签筛选行：紧贴时间范围下面（2026-10-15 反馈「挪到时间下面」）。标签是
+             第二个筛选维度，跟范围切换放同一列才像个过滤器；行尾的「清除」只在
+             筛选激活时出现 -->
+        <div v-if="allTags.length" class="tv-tagbar">
+          <button
+            v-for="tag in allTags"
+            :key="tag.id"
+            type="button"
+            class="tv-tagchip"
+            :class="{ on: tagFilter.includes(tag.id) }"
+            :title="`点击按「${tag.name}」筛选待办（再点取消）`"
+            @click="toggleTagFilter(tag.id)"
+          >
+            <i class="dot" :style="{ background: tag.color || 'var(--brand-500)' }"></i>{{ tag.name }}
+            <span class="cnt">{{ tagCounts.get(tag.id) ?? 0 }}</span>
+            <span class="x" title="删除该标签" @click.stop="removingTag = tag"><X :size="10" :stroke-width="2.5" /></span>
+          </button>
+          <button
+            v-if="tagFilter.length"
+            type="button"
+            class="tv-tagclear"
+            title="清除标签筛选"
+            @click="tagFilter = []"
+          >
+            清除
+          </button>
+        </div>
+
         <div ref="bodyRef" class="tv-scroll">
-          <p v-if="!groups.length" class="tv-empty">这个范围里没有待办</p>
+          <p v-if="!groups.length" class="tv-empty">
+            {{ tagFilter.length ? '没有符合所选标签的待办' : '这个范围里没有待办' }}
+          </p>
           <div v-for="g in groups" :key="g.label" class="tv-group" :data-group="g.label">
             <div
               class="tv-group-h"
@@ -563,7 +632,7 @@ function onVirtualDown(e: PointerEvent) {
             <span class="tv-day">{{ c.day }}</span>
             <div class="tv-chips">
               <button
-                v-for="t in realByDay.get(c.key) ?? []"
+                v-for="t in chipsOf(c.key).real"
                 :key="'r' + t.id"
                 type="button"
                 class="tv-chip real"
@@ -576,13 +645,21 @@ function onVirtualDown(e: PointerEvent) {
                 {{ t.title }}
               </button>
               <span
-                v-for="o in virtualByDay.get(c.key) ?? []"
+                v-for="o in chipsOf(c.key).virtual"
                 :key="'v' + o.todo_id + o.at_ms"
                 class="tv-chip virtual"
                 :title="`${titleOf.get(o.todo_id) ?? '周期待办'}（周期规则算出的未来实例，不能拖动）`"
                 @pointerdown="onVirtualDown"
               >
                 {{ titleOf.get(o.todo_id) ?? '周期待办' }}
+              </span>
+              <!-- 折叠尾巴：只提示数量，点击落到格子上选中当天，完整清单看下方明细 -->
+              <span
+                v-if="chipsOf(c.key).extra > 0"
+                class="tv-chip more"
+                :title="`还有 ${chipsOf(c.key).extra} 条没展示，点格子看当天全部待办`"
+              >
+                …+{{ chipsOf(c.key).extra }}
               </span>
             </div>
           </div>
@@ -600,7 +677,7 @@ function onVirtualDown(e: PointerEvent) {
             <div class="tv-weekhead">{{ c.date.getMonth() + 1 }}/{{ c.date.getDate() }} 周{{ ['一', '二', '三', '四', '五', '六', '日'][(c.date.getDay() + 6) % 7] }}</div>
             <div class="tv-chips">
               <button
-                v-for="t in realByDay.get(c.key) ?? []"
+                v-for="t in chipsOf(c.key).real"
                 :key="'r' + t.id"
                 type="button"
                 class="tv-chip real"
@@ -614,13 +691,20 @@ function onVirtualDown(e: PointerEvent) {
                 <i v-if="t.due_at" class="time">{{ fmtHM(t.due_at) }}</i>
               </button>
               <span
-                v-for="o in virtualByDay.get(c.key) ?? []"
+                v-for="o in chipsOf(c.key).virtual"
                 :key="'v' + o.todo_id + o.at_ms"
                 class="tv-chip virtual"
                 :title="`${titleOf.get(o.todo_id) ?? '周期待办'}（周期规则算出的未来实例，不能拖动）`"
                 @pointerdown="onVirtualDown"
               >
                 {{ titleOf.get(o.todo_id) ?? '周期待办' }}
+              </span>
+              <span
+                v-if="chipsOf(c.key).extra > 0"
+                class="tv-chip more"
+                :title="`还有 ${chipsOf(c.key).extra} 条没展示，点格子看当天全部待办`"
+              >
+                …+{{ chipsOf(c.key).extra }}
               </span>
             </div>
           </div>
@@ -744,6 +828,45 @@ function onVirtualDown(e: PointerEvent) {
   color: var(--text-1);
   font-weight: 600;
 }
+/* chip 上的待办计数：弱化展示，激活态跟着主色走。
+   自居中 flex 药丸 + line-height 1：小字号计数与 CJK 标签名行盒度量不同，
+   用行高撑盒会让数字视觉上偏高——药丸自身对称包住数字，再由 chip 的
+   align-items: center 对齐标签名 */
+.tv-tagchip .cnt {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: var(--text-4);
+  background: var(--bg-page);
+  border-radius: var(--radius-pill);
+  padding: 2px 5px;
+  line-height: 1;
+}
+.tv-tagchip.on .cnt {
+  color: var(--brand-500);
+}
+/* 标签筛选行：时间范围下面一行 chips；「清除」弱化为文字按钮，仅筛选激活时出现 */
+.tv-tagbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  /* 水平不加额外内边距：与上方工具栏「今天」按钮同一条 12px 卡片内边距线对齐 */
+  padding: 2px 0 10px;
+}
+.tv-tagclear {
+  border: none;
+  background: transparent;
+  padding: 3px 8px;
+  font-size: 0.72rem;
+  color: var(--brand-500);
+  cursor: pointer;
+  border-radius: var(--radius-pill);
+}
+.tv-tagclear:hover {
+  background: var(--brand-50);
+}
 .tv-tagchip .x {
   display: inline-flex;
   opacity: 0;
@@ -796,6 +919,12 @@ function onVirtualDown(e: PointerEvent) {
   color: #fff;
   font-weight: 600;
 }
+/* 范围档计数（与标签 chip 的 .cnt 同语言）：筛选生效的即时反馈 */
+.tv-seg button .cnt {
+  margin-left: 3px;
+  font-weight: 400;
+  opacity: 0.62;
+}
 .tv-ghost {
   padding: 4px 10px;
   font-size: 0.72rem;
@@ -829,7 +958,14 @@ function onVirtualDown(e: PointerEvent) {
   flex-direction: column;
   gap: 8px;
   padding: 12px;
+}
+/* 左列表整卡滚动照旧；右卡自身不滚——点格子后上下滚动只滚「当天明细」清单，
+   不把上面的整个日历带起来（反馈：看当天待办时日历跟着滚走了） */
+.tv-list {
   overflow: auto;
+}
+.tv-cal {
+  overflow: hidden;
 }
 .tv-body:not(.narrow) .tv-list {
   flex: 0 0 40%;
@@ -1007,6 +1143,14 @@ function onVirtualDown(e: PointerEvent) {
   gap: 2px;
   margin-top: 2px;
 }
+/* 折叠尾巴「…+N」：不可交互的纯提示，点击落在日历格上选中当天（完整清单看下方明细） */
+.tv-chip.more {
+  background: transparent;
+  border: 1px dashed var(--border-soft);
+  color: var(--text-4);
+  text-align: center;
+  cursor: default;
+}
 .tv-chip {
   display: block;
   width: 100%;
@@ -1066,6 +1210,9 @@ function onVirtualDown(e: PointerEvent) {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* 占满日历下方剩余空间；日期头固定在外，只有清单自己滚 */
+  flex: 1;
+  min-height: 0;
 }
 .tv-dayview-h {
   display: flex;
@@ -1089,6 +1236,10 @@ function onVirtualDown(e: PointerEvent) {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  /* 右卡唯一的滚动区：当天待办多时只滚这份清单 */
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 .tv-dayview-row {
   display: flex;

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { Check, GripVertical, LayoutGrid, X } from 'lucide-vue-next'
+import { Check, ChevronDown, GripVertical, LayoutGrid, X } from 'lucide-vue-next'
 import {
   DASH_COLS,
   MIN_SIZE,
@@ -15,6 +15,7 @@ import {
   findFreeSpot,
   isLivePreview,
   useDashboardLayout,
+  type DashModuleDef,
   type DashPlacement,
   type DashVariantDef,
 } from '../composables/useDashboardLayout'
@@ -96,6 +97,34 @@ function curVariantId(id: string): string {
 function selectLibVariant(id: string, vId: string) {
   libVariant.value = { ...libVariant.value, [id]: vId }
 }
+
+// 模块库分组风琴：内置一组 + 每个扩展各一组（组名 = 扩展名），
+// 默认全部收起，单开互斥（再点当前组收起）；内置与扩展之间由分隔线区隔
+interface LibGroup {
+  key: string
+  label: string
+  items: DashModuleDef[]
+  emptyText: string
+}
+const openGroup = ref<string | null>(null)
+function toggleGroup(key: string) {
+  openGroup.value = openGroup.value === key ? null : key
+}
+const libGroups = computed<LibGroup[]>(() => {
+  const all = layout.available.value
+  const groups: LibGroup[] = [
+    {
+      key: 'builtin',
+      label: '内置',
+      items: all.filter((m) => !m.id.startsWith('ext:')),
+      emptyText: '已全部放置到画布',
+    },
+  ]
+  for (const m of all.filter((m) => m.id.startsWith('ext:'))) {
+    groups.push({ key: m.id, label: m.title, items: [m], emptyText: '' })
+  }
+  return groups
+})
 
 function variantName(p: DashPlacement): string {
   return dashVariantDef(p.id, p.variant)?.name ?? ''
@@ -506,36 +535,55 @@ function previewComponent(id: string) {
       <!-- 左侧：模块库（多形态模块先选形态） -->
       <aside class="le-library" aria-label="模块库">
         <p class="le-lib-title">模块库</p>
+        <template v-for="g in libGroups" :key="g.key">
+          <section class="le-lib-group" :class="{ open: openGroup === g.key }">
+          <button
+            type="button"
+            class="le-lib-ghead"
+            :aria-expanded="openGroup === g.key"
+            @click="toggleGroup(g.key)"
+          >
+            <ChevronDown class="le-lib-caret" :size="14" :stroke-width="2.2" aria-hidden="true" />
+            <span class="le-lib-gname">{{ g.label }}</span>
+            <span class="le-lib-gcount">{{ g.items.length }}</span>
+          </button>
+          <div v-if="openGroup === g.key" class="le-lib-gbody">
+            <div
+              v-for="m in g.items"
+              :key="m.id"
+              class="le-lib-item"
+              @pointerdown="startMove(m.id, 'library', $event)"
+            >
+              <div class="le-lib-head">
+                <GripVertical :size="14" :stroke-width="2" aria-hidden="true" />
+                <span class="le-lib-name">{{ m.title }}</span>
+                <span class="le-lib-size">{{ curVariantOf(m.id)?.idealW }}×{{ curVariantOf(m.id)?.idealH }}</span>
+              </div>
+              <div v-if="m.variants.length > 1" class="le-lib-variants">
+                <button
+                  v-for="vd in m.variants"
+                  :key="vd.id"
+                  type="button"
+                  class="le-vchip"
+                  :class="{ on: curVariantId(m.id) === vd.id }"
+                  @pointerdown.stop="selectLibVariant(m.id, vd.id)"
+                >{{ vd.name }}</button>
+              </div>
+              <div class="le-lib-meta">
+                <span class="le-lib-pill">最小 {{ curVariantOf(m.id)?.minW }}×{{ curVariantOf(m.id)?.minH }}</span>
+                <span class="le-lib-pill">推荐 {{ curVariantOf(m.id)?.idealW }}×{{ curVariantOf(m.id)?.idealH }}</span>
+                <span class="le-lib-desc">{{ curVariantOf(m.id)?.desc }}</span>
+              </div>
+            </div>
+            <p v-if="g.items.length === 0" class="le-lib-empty">{{ g.emptyText }}</p>
+          </div>
+        </section>
         <div
-          v-for="m in layout.available.value"
-          :key="m.id"
-          class="le-lib-item"
-          @pointerdown="startMove(m.id, 'library', $event)"
-        >
-          <div class="le-lib-head">
-            <GripVertical :size="14" :stroke-width="2" aria-hidden="true" />
-            <span class="le-lib-name">{{ m.title }}</span>
-            <span class="le-lib-size">{{ curVariantOf(m.id)?.idealW }}×{{ curVariantOf(m.id)?.idealH }}</span>
-          </div>
-          <div v-if="m.variants.length > 1" class="le-lib-variants">
-            <button
-              v-for="vd in m.variants"
-              :key="vd.id"
-              type="button"
-              class="le-vchip"
-              :class="{ on: curVariantId(m.id) === vd.id }"
-              @pointerdown.stop="selectLibVariant(m.id, vd.id)"
-            >{{ vd.name }}</button>
-          </div>
-          <div class="le-lib-meta">
-            <span class="le-lib-pill">最小 {{ curVariantOf(m.id)?.minW }}×{{ curVariantOf(m.id)?.minH }}</span>
-            <span class="le-lib-pill">推荐 {{ curVariantOf(m.id)?.idealW }}×{{ curVariantOf(m.id)?.idealH }}</span>
-            <span class="le-lib-desc">{{ curVariantOf(m.id)?.desc }}</span>
-          </div>
-        </div>
-        <p v-if="layout.available.value.length === 0" class="le-lib-empty">
-          所有模块都已放置
-        </p>
+          v-if="g.key === 'builtin' && libGroups.length > 1"
+          class="le-lib-divider"
+          aria-hidden="true"
+        />
+        </template>
       </aside>
 
       <!-- 右侧：等比缩略画布 -->
@@ -793,6 +841,66 @@ function previewComponent(id: string) {
   color: var(--text-3);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.le-lib-group {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--bg-card-soft);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.le-lib-ghead {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 7px 10px;
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-2);
+  transition: color 0.15s;
+}
+.le-lib-ghead:hover {
+  color: var(--brand-500);
+}
+.le-lib-caret {
+  flex-shrink: 0;
+  color: var(--text-3);
+  transition: transform 0.15s;
+}
+.le-lib-group.open .le-lib-caret {
+  transform: rotate(180deg);
+}
+.le-lib-group.open .le-lib-ghead {
+  color: var(--brand-500);
+}
+.le-lib-gname {
+  flex: 1;
+  text-align: left;
+}
+.le-lib-gcount {
+  font-size: 0.6875rem;
+  color: var(--text-3);
+  background: var(--bg-card-solid);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  padding: 0 8px;
+  font-variant-numeric: tabular-nums;
+}
+.le-lib-gbody {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 8px 8px;
+}
+.le-lib-divider {
+  height: 1px;
+  background: var(--border-soft);
+  margin: 1px 0;
+  flex-shrink: 0;
 }
 .le-lib-item {
   border: 1px solid var(--border-soft);

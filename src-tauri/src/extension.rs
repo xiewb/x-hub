@@ -144,6 +144,64 @@ pub struct ModuleOptions {
     pub default_hide_title: Option<bool>,
 }
 
+/// 扩展声明给 AI 助手的工具（manifest.agent.tools[]，可选）。
+/// 这是「宿主不知道扩展里有什么数据」的解法：扩展**自描述**——声明工具名、用途、
+/// 参数 JSON Schema 与返回值形状，宿主聚合后经 extension_tool_list/call 两个
+/// 内置 Agent 工具暴露给模型（对齐 MCP tools/list + tools/call 模式）。
+/// 一期仅 service 扩展可声明：后端由宿主托管常驻，AI 随时可调，不依赖扩展页面是否打开。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentToolDecl {
+    /// 工具名（扩展内唯一，[a-z0-9_-]；模型看到的是 extension_tool_call 的 args，非全局命名空间）
+    pub name: String,
+    /// 一句话说明用途与返回内容（模型判断「什么时候该调我」的唯一依据，务必写清）
+    pub description: String,
+    /// 审批档位：read（默认）/ write / dangerous——**AI 侧授权档**，与 manifest.permissions
+    /// 两套体系（计划 §5 铁律：AI 工具授权 ≠ 扩展 manifest 权限，不可混用）
+    #[serde(default = "default_agent_level")]
+    pub level: String,
+    /// 参数 JSON Schema（object，缺省 = 无参）；与内置 AgentTool::parameters 同口径
+    #[serde(default)]
+    pub parameters: Value,
+    /// 返回值形状说明（可选，纯文本）：告诉模型结果长什么样，免试调一轮
+    #[serde(default)]
+    pub returns: String,
+}
+
+fn default_agent_level() -> String {
+    "read".to_string()
+}
+
+impl AgentToolDecl {
+    /// 语义校验：name/description 非空且 name 限 [a-z0-9_-]，level 三档白名单，
+    /// parameters 缺省或为 object。不合格的声明在装配 ExtensionEntry 时**跳过并落日志**
+    /// （一条坏声明不能弄哑整个扩展），返回 Err 的原因供日志定位。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("工具名为空".into());
+        }
+        if !self.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+            return Err(format!("工具名 {} 含非法字符（只允许小写字母/数字/_/-）", self.name));
+        }
+        if self.description.trim().is_empty() {
+            return Err(format!("工具 {} 缺 description（模型靠它判断何时调用）", self.name));
+        }
+        if !matches!(self.level.as_str(), "read" | "write" | "dangerous") {
+            return Err(format!("工具 {} 的 level {} 不在三档白名单", self.name, self.level));
+        }
+        if !self.parameters.is_null() && !self.parameters.is_object() {
+            return Err(format!("工具 {} 的 parameters 必须是 JSON object", self.name));
+        }
+        Ok(())
+    }
+}
+
+/// manifest.agent 整体（可选）：{ "tools": [ ... ] }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentSpec {
+    #[serde(default)]
+    pub tools: Vec<AgentToolDecl>,
+}
+
 /// 扩展 manifest（manifest.json），对齐 spec §4。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtensionManifest {
@@ -209,6 +267,9 @@ pub struct ExtensionManifest {
     /// 工作台模块选项（manifest 字段为 moduleOptions；module 形态可选）
     #[serde(default, rename = "moduleOptions")]
     pub module_options: ModuleOptions,
+    /// 声明给 AI 助手的工具（manifest.agent.tools；经校验后的合格子集，见 AgentToolDecl）
+    #[serde(default)]
+    pub agent: Option<AgentSpec>,
 }
 
 fn default_kind() -> String {
@@ -267,6 +328,8 @@ pub struct ExtensionEntry {
     /// 安装时间（目录创建时间，RFC3339；前端「已安装」列表按此排序，最后安装的在最下面）。
     /// 取文件系统元数据，对本客户端装之前就存在的扩展同样有效；取不到时为 None
     pub installed_at: Option<String>,
+    /// 声明给 AI 助手的工具（manifest.agent.tools 校验后的合格子集；扩展设置弹窗展示 + 聚合给 Agent）
+    pub agent_tools: Vec<AgentToolDecl>,
 }
 
 fn runtime_str(r: &ExtensionRuntime) -> &'static str {
@@ -414,6 +477,7 @@ fn load_extension(dir: &Path, source: &str) -> ExtensionEntry {
         module_variants: Vec::new(),
         module_options: ModuleOptions::default(),
         installed_at: installed_at.clone(),
+        agent_tools: Vec::new(),
     };
 
     let manifest = match read_manifest(dir) {
@@ -442,6 +506,10 @@ fn load_extension(dir: &Path, source: &str) -> ExtensionEntry {
         .cloned()
         .collect();
 
+    // AI 工具声明校验：合格的进 Entry（扩展设置弹窗展示 + Agent 聚合共用），
+    // 坏声明跳过并落日志——一条坏声明不能弄哑整个扩展
+    let agent_tools = filter_agent_tools(&manifest.id, manifest.agent.as_ref());
+
     ExtensionEntry {
         id: manifest.id,
         name: manifest.name,
@@ -468,7 +536,31 @@ fn load_extension(dir: &Path, source: &str) -> ExtensionEntry {
         module_variants: manifest.module_variants,
         module_options: manifest.module_options,
         installed_at,
+        agent_tools,
     }
+}
+
+/// 校验 manifest.agent.tools：只保留合格声明；重名/不合格的跳过并落日志。
+/// 单一校验点——ExtensionEntry.agent_tools 的消费者（扩展设置弹窗、Agent 聚合器）
+/// 拿到的都已经是干净清单，不必各自再验。
+fn filter_agent_tools(ext_id: &str, agent: Option<&AgentSpec>) -> Vec<AgentToolDecl> {
+    let Some(spec) = agent else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for t in &spec.tools {
+        if let Err(e) = t.validate() {
+            log::warn!("扩展 {ext_id} 的 AI 工具声明被跳过：{e}");
+            continue;
+        }
+        if !seen.insert(t.name.clone()) {
+            log::warn!("扩展 {ext_id} 的 AI 工具 {} 重名，后者被跳过", t.name);
+            continue;
+        }
+        out.push(t.clone());
+    }
+    out
 }
 
 /// 列出已安装扩展（Tauri 命令）。

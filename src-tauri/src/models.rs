@@ -524,13 +524,28 @@ pub struct ChatSession {
     pub elapsed_ms: i64,
 }
 
-/// AI 对话消息（user / assistant）
+/// AI 对话消息（user / assistant / tool；tool 行携带 tool_call_id / tool_name / tool_status）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: i64,
     pub session_id: i64,
+    /// 一次用户输入 = 一个 turn（时间线分组 / 上下文截断 / 服务端计费共用键，计划 §6）
+    #[serde(default)]
+    pub turn_id: Option<String>,
     pub role: String,
     pub content: String,
+    /// assistant 消息携带的工具调用请求（JSON 数组文本）
+    #[serde(default)]
+    pub tool_calls: Option<String>,
+    /// tool 消息对应的调用 id
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// tool 消息的工具名（UI 与统计用）
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// tool 结果状态：ok / error / denied
+    #[serde(default)]
+    pub tool_status: Option<String>,
     pub created_at: String,
 }
 

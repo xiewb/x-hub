@@ -1,10 +1,10 @@
 # x-hub (个人效率工作台)
 
-**生成:** 2026-08-29 | **分支:** master | **版本:** 0.8.3
+**生成:** 2026-08-29 | **分支:** master | **版本:** 0.9.0
 
 ## 概述
 
-基于 Tauri 2 + Vue 3 + Tailwind CSS 4 的本地桌面效率工作台（Bento 风格 Dashboard）。侧栏导航含 **工作台**（自由网格布局：时钟/天气/便签×2/系统监视/提示词/待办/日历/倒计时/概览卡 + 最近使用通栏，时钟与天气支持多形态展示，可经布局编辑器所见即所得编排）、**待办**（标签筛选 / 月·周日历 / 周期待办 / 置顶）、**速记**（笔记）、**速达**（应用/网页/文件资源），另有**扩展中心/扩展视图**与侧栏左下角独立入口**设置**（两级导航：左栏 7 大类 常规/外观/工作台/功能/扩展/账号/数据与关于，当前大类的子项在其下缩进展开——如「扩展」下含 扩展 / Skills；顶部另有**设置项搜索**；右侧**只挂载当前大类**的分区）。主要子系统：**AI 对话面板**（OpenAI 兼容流式，Ctrl+Shift+K）、**剪贴板历史**（Ctrl+`）、**扩展系统**（module/view/window/drawer 四形态 + service 托管 + 市场）、**应用自动更新**、**倒计时浮窗**、**天气/一言**。Rust 后端管理 SQLite 数据持久化，前端使用 Vite 8 + TypeScript 6。
+基于 Tauri 2 + Vue 3 + Tailwind CSS 4 的本地桌面效率工作台（Bento 风格 Dashboard）。侧栏导航含 **工作台**（自由网格布局：时钟/天气/便签×2/系统监视/提示词/待办/日历/倒计时/概览卡 + 最近使用通栏，时钟与天气支持多形态展示，可经布局编辑器所见即所得编排）、**待办**（标签筛选 / 月·周日历 / 周期待办 / 置顶）、**速记**（笔记）、**速达**（应用/网页/文件资源），另有**扩展中心/扩展视图**与侧栏左下角独立入口**设置**（两级导航：左栏 8 大类 常规/外观/工作台/AI 助手/功能/扩展/账号/数据与关于（AI 助手 2026-10-16 自「功能」拉出为独立大类，含 AI 助手 / AI 额度 两个子项），当前大类的子项在其下缩进展开——如「扩展」下含 扩展 / Skills；顶部另有**设置项搜索**；右侧**只挂载当前大类**的分区）。主要子系统：**AI 对话与 Agent 底座**（宿主内自研 agent loop，0.9.0：34 个内置工具 + 扩展自描述工具、权限三档 + 会话级授权、turn 循环，见 `docs/agent-foundation-plan.md` §13；OpenAI 兼容流式，Ctrl+Shift+K）、**剪贴板历史**（Ctrl+`）、**扩展系统**（module/view/window/drawer 四形态 + service 托管 + 市场）、**应用自动更新**、**倒计时浮窗**、**天气/一言**。Rust 后端管理 SQLite 数据持久化，前端使用 Vite 8 + TypeScript 6。
 
 ## 结构
 
@@ -67,11 +67,11 @@ x-hub/
 │       ├── DashboardLayoutEditor.vue # 工作台布局编辑器视图（所见即所得：clock/weather 真实卡片 + 其余模块真实结构等比缩印、形态切换、最小尺寸钳制 + 适配徽标，保存 dashboard_layout）
 │       ├── DashModulePreview.vue # 布局编辑器模块预览：逐张复刻真实卡片 DOM 与设计令牌，尺寸按 --dp-k 等比缩印，数据取 store 真值（同一组件供画布与形态浮层缩略图共用）
 │       ├── AboutSection.vue    # 设置「关于」区（版本/开源声明/版本历史/检查更新）
-│       ├── SettingsView.vue    # 设置页**外壳**：两级导航（左栏 7 大类 + 当前大类的子项缩进展开）+ 设置项搜索 + 面板路由（按需加载，见约定 50）
+│       ├── SettingsView.vue    # 设置页**外壳**：两级导航（左栏 8 大类 + 当前大类的子项缩进展开）+ 设置项搜索 + 面板路由（按需加载，见约定 50）
 │       ├── SettingsSkeleton.vue # 设置页外壳加载骨架（异步分包期间的同形占位；配置在 index.vue 的 defineAsyncComponent）
 │       ├── settingsIndex.generated.ts # 设置项搜索索引（**自动生成，勿手改**：scripts/gen-settings-index.mjs 扫外壳 + settings/*.vue 提取，见约定 49）
-│       ├── settings/           # 设置页 7 个大类面板（各含自己的脚本 + 模板，按需 import）
-│       │   ├── GeneralPanel.vue / AppearancePanel.vue / WorkbenchPanel.vue / FeaturesPanel.vue / ExtensionsPanel.vue（含「扩展」「Skills」两个分区，Skills 分区抽成同目录 SkillsSection.vue；本地扩展目录的增删在扩展中心「我的扩展」标签页，见约定 55）/ AccountPanel.vue / DataPanel.vue
+│       ├── settings/           # 设置页 8 个大类面板（各含自己的脚本 + 模板，按需 import）
+│       │   ├── GeneralPanel.vue / AppearancePanel.vue / WorkbenchPanel.vue / AiPanel.vue（AI 助手大类：对话形态/供应商模型/AI 额度，2026-10-16 自 FeaturesPanel 拉出，额度自 AccountPanel 并入）/ FeaturesPanel.vue / ExtensionsPanel.vue（含「扩展」「Skills」两个分区，Skills 分区抽成同目录 SkillsSection.vue；本地扩展目录的增删在扩展中心「我的扩展」标签页，见约定 55）/ AccountPanel.vue / DataPanel.vue
 │       │   ├── PanelLoading.vue # 面板加载占位（切大类时避免右侧空白）
 │       │   └── shared.css      # 设置页样式（外移自 scoped，规则统一带 .settings-view 前缀，见约定 50）
 │       └── ContextMenu.vue     # 通用右键菜单
@@ -93,6 +93,7 @@ x-hub/
 │   │   ├── sysmon.rs           # 系统资源监视（CPU/内存，sysinfo crate）
 │   │   ├── chat.rs             # OpenAI 兼容 SSE 流式对话客户端 + API Key 系统钥匙串（keyring）存取
 │   │   ├── chat_window.rs      # AI 对话独立窗口（label chat：无条件启动预创建隐藏常驻 + show/hide 快操作 + 几何防抖落盘 + 置顶持久化，运行期绝不建窗，见约定 33/41）
+│   │   ├── agent/              # Agent 底座（0.9.0，ADR 0006）：mod.rs 模块索引 / tools.rs+builtin.rs 工具注册表（34 内置：读 15/写 14/危险 5）/ turn.rs 循环编排（10 轮上限）/ context.rs 按 turn 截断+工具消息成对剪枝 / prompt.rs system prompt / approval.rs+state.rs 审批与会话级授权（只存内存）/ ext_tools.rs 扩展自描述工具聚合（manifest.agent.tools），实施记录见 `docs/agent-foundation-plan.md` §13
 │   │   ├── clipboard.rs        # 剪贴板监听与历史（文本/图片落盘/文件）+ 粘贴注入（clipboard_paste_method）
 │   │   ├── online.rs           # 联网服务：连通性探活/天气（Open-Meteo）/城市地理编码/IP 定位/名言（hitokoto）
 │   │   ├── extension.rs        # 扩展扫描/安装/卸载/权限 + extensions_stamp 热更新检测
@@ -123,8 +124,8 @@ x-hub/
 │   ├── r2-distribution-and-updater.md        # 扩展市场 R2 分发与应用自动更新方案（P0–P3 已实施）
 │   ├── self-hosted-distribution.md           # 分发端点迁移方案（腾讯云 COS 替代 R2，脚本/CI 已切换；Nginx 备选）
 │   ├── file-search-plan.md                   # 本地文件搜索方案（已定稿待实现）
-│   ├── agent-foundation-plan.md              # Agent 底座实施方案（已定稿待实现；选型决策见 adr/0006）
-│   └── adr/                    # 架构决策记录（0001 首次使用引导 / 0006 Agent 底座选型：均待实施）
+│   ├── agent-foundation-plan.md              # Agent 底座实施方案（已实施 0.9.0，实施记录见其 §13；选型决策见 adr/0006）
+│   └── adr/                    # 架构决策记录（0001 首次使用引导：待实施 / 0006 Agent 底座选型：已实施 0.9.0 / 0016 平台额度积分制：已实施）
 ├── DESIGN.md                   # 当前设计系统（唯一实现基线，与 style.css 对齐；§8 为 Reka UI 组件规范）
 ├── PRODUCT.md                  # 产品定义（用户/目标/品牌个性/设计原则/无障碍基线）
 ├── CONTEXT.md                  # 领域术语表（易混淆概念精确区分；「引导」节为规划中未实施）
@@ -321,5 +322,6 @@ npm run tauri:test    # Rust 单元测试（Windows 必须走此包装脚本，�
 
 - 已决策未实施：**首次使用引导**（快速设置弹窗 + 帮助视图；决策见 `docs/adr/0001-first-run-onboarding.md`，术语预登记于 `CONTEXT.md`「引导」节，实施前代码中无 OnboardingDialog/HelpView/onboarding_done）
 - 方案已定稿未实施：**本地文件搜索**（索引工作区模型，见 `docs/file-search-plan.md`）
-- 方案已定稿未实施：**Agent 底座**（宿主内自研 agent loop，非外部引擎；模型接入走「平台额度 + BYOK」双路，13 个首批工具 + 三档权限模式；选型决策见 `docs/adr/0006-agent-runtime-selection.md`，实施蓝图见 `docs/agent-foundation-plan.md`。实施前代码中无 `src-tauri/src/agent/`、`chat_messages` 无 `turn_id` 列、`role` 仍只有 user/assistant）
+- ~~方案已定稿未实施：**Agent 底座**~~（**已实施**，0.9.0：`src-tauri/src/agent/` 上线——mod/tools/builtin/approval/turn/context/prompt/state 七件套 + 34 个内置工具 + 权限三档（readonly/ask/full，会话级授权）+ turn 循环；选型决策见 `docs/adr/0006-agent-runtime-selection.md`，实施蓝图见 `docs/agent-foundation-plan.md`）
+- 已实施（0.9.x）：**扩展向 AI 助手暴露工具**（manifest 自描述，对齐 MCP tools/list + tools/call）——service 扩展在 manifest 声明 `agent.tools[]`（name/description/level/parameters JSON Schema/returns），`agent/ext_tools.rs` 聚合已启用且未被用户关闭的声明，`extension_tool_list` / `extension_tool_call` 两个内置工具消费；转发约定：宿主 POST 后端 `/xhub/agent-tool`（body `{"tool","args"}`，2xx 响应体即结果，上限 256KB，后端没在跑会自动拉起）；审批档位按声明 `level` 动态取（`AgentTool::approval_for` 覆写，会话授权键带 ext/tool 细粒度）；开关 = 设置 → AI 助手总开关 + 扩展设置弹窗「AI 助手」区块每扩展开关（`agent_ext_tools_enabled` / `agent_ext_tool_grants`，缺省允许）；**AI 工具授权 ≠ 扩展 manifest 权限，两套体系不可混用**；扩展开发侧规范见 `skills/x-hub-extension/references/manifest.md`「AI 助手工具」与 `service.md`「AI 工具端点」
 - 可探索方向：拖拽排序动效打磨、键盘导航、前端单元测试、打包发布全流程验证（tauri:build）

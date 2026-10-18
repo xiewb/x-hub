@@ -1,4 +1,5 @@
 mod account;
+mod agent;
 mod api_spec;
 mod autostart;
 mod browsers;
@@ -172,6 +173,24 @@ pub(crate) fn is_position_on_screen(x: f64, y: f64) -> bool {
     x >= -10000.0 && x <= 10000.0 && y >= -10000.0 && y <= 10000.0
 }
 
+/// 移动/缩放防抖保存的代数计数：拖动窗口时 Moved/Resized 连发，每次 bump 代数 +
+/// 起一个 800ms 延迟任务，只有代数仍最新的任务真正落盘（旧任务自行退出），
+/// 避免拖一次写几十次配置文件
+static GEOM_SAVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 触发一次防抖保存（Moved/Resized 事件共用）
+fn schedule_geometry_save(app_handle: &tauri::AppHandle) {
+    let gen = GEOM_SAVE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    let handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        if GEOM_SAVE_GEN.load(std::sync::atomic::Ordering::Acquire) != gen {
+            return;
+        }
+        persist_window_state(&handle);
+    });
+}
+
 /// 主窗句柄统一入口（ADR 0011 起必须走这里）：
 /// 主窗自「速达应用内打开网页」起内嵌了子 webview（suda-panel），tauri 的
 /// `get_webview_window` 内部校验 is_webview_window（窗口上所有 webview 的 label
@@ -259,7 +278,13 @@ fn restore_window_state(app: &tauri::App) {
         let _ = window.set_size(tauri::LogicalSize::new(ws.width, ws.height));
         if let (Some(x), Some(y)) = (ws.x, ws.y) {
             if is_position_on_screen(x, y) {
-                let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+                // 物理坐标直接恢复（persist 已存物理值）：set_position(PhysicalPosition)
+                // 与窗口当前所在屏的 DPI 无关。之前恢复走 LogicalPosition，启动时窗口
+                // 还停在默认位置（主屏），按主屏 scale 反算物理坐标——双屏缩放比不同
+                // 时坐标系统性偏移，多屏用户「重启后副屏窗口跑回主屏」的根因之一。
+                // 旧版配置存的是逻辑值，混合缩放用户升级后首次恢复可能偏移一次，
+                // 之后保存/恢复全走物理坐标，永远精确；完全出屏由 rescue 兜底拉回。
+                let _ = window.set_position(tauri::PhysicalPosition::new(x as i32, y as i32));
             }
         }
         // 位置恢复后先救出屏：is_position_on_screen 的 ±10000 粗检挡不住拔掉
@@ -318,10 +343,16 @@ fn restore_window_state(app: &tauri::App) {
     }
 }
 
-/// 保存窗口位置与尺寸到配置
-fn persist_window_state(app: &tauri::AppHandle) {
+/// 保存窗口位置与尺寸到配置（物理坐标落盘，语义见函数内注释）
+pub(crate) fn persist_window_state(app: &tauri::AppHandle) {
     if let Some(window) = main_window(app) {
         if window.is_minimized().unwrap_or(false) {
+            return;
+        }
+        // 窗口不可见时不覆盖已保存几何：relaunch_app（升级/立即重启）会在窗口
+        // 尚未显示的启动早期调用本函数，若照常保存，默认居中坐标会把用户
+        // 真实的副屏位置覆盖掉
+        if !window.is_visible().unwrap_or(false) {
             return;
         }
         // 最大化态不覆盖记忆的常规几何：保存的是放大后的整屏尺寸，下次启动
@@ -331,17 +362,18 @@ fn persist_window_state(app: &tauri::AppHandle) {
         }
         if let Ok(pos) = window.outer_position() {
             if let Ok(size) = window.inner_size() {
-                // inner_size/outer_position 返回物理像素，落盘前统一折算成逻辑像素：
-                // 恢复侧按 LogicalSize/LogicalPosition 解释，直接存物理值会在非 100%
-                // 缩放下每关开一轮放大 scale_factor 倍、位置同步向右下漂移
-                //（125% 用户窗口逐次涨到超出屏幕即此因，2026-09-29 修）
+                // 位置存**物理像素**、尺寸仍存逻辑像素：恢复侧 set_position 用
+                // PhysicalPosition，与窗口所在屏的 DPI 无关。之前位置按保存时窗口
+                // 所在屏的 scale 折算成逻辑值落盘，恢复时窗口还停在主屏、按主屏
+                // scale 反算物理坐标——双屏缩放比不同则每次恢复都系统性偏移
+                //（「升级重启后副屏窗口回到主屏」根因之二）。尺寸用 LogicalSize
+                // 恢复，语义不受所在屏影响，保持逻辑值不变
                 let scale = window.scale_factor().unwrap_or(1.0);
-                let pos = pos.to_logical::<f64>(scale);
                 let size = size.to_logical::<f64>(scale);
                 let _guard = config::lock();
                 let mut cfg = config::load();
-                cfg.window.x = Some(pos.x);
-                cfg.window.y = Some(pos.y);
+                cfg.window.x = Some(pos.x as f64);
+                cfg.window.y = Some(pos.y as f64);
                 cfg.window.width = size.width;
                 cfg.window.height = size.height;
                 match config::save(&cfg) {
@@ -512,6 +544,8 @@ pub fn run() {
             let conn = init_database()?;
             fix_icon_paths(&conn);
             app.manage(DbState(std::sync::Mutex::new(conn)));
+    // Agent 运行时状态（#t44）：审批挂起表 / 会话级授权 / 中断旗标
+    app.manage(std::sync::Arc::new(agent::state::AgentState::new()));
             app.manage(clipboard::ClipboardState::default());
             app.manage(service::ServiceState::default());
             // 开发扩展目录映射（「我的扩展」登记；扩展协议与扫描按它解析源码目录）
@@ -649,6 +683,10 @@ pub fn run() {
             // 启动待办提醒后台线程（remind_at 到点发系统通知 + 前端 toast）
             todo_reminder::start(app.handle().clone());
 
+            // 扩展 AI 工具聚合器（manifest.agent.tools）：注入宿主句柄，
+            // extension_tool_list/call 经它扫描扩展与转发 service 后端
+            agent::ext_tools::init(app.handle().clone());
+
             // 启动剪贴板监听线程（启动零加载历史，仅剪贴板变化时落库）
             clipboard::start_monitor(app.handle().clone());
 
@@ -686,12 +724,16 @@ pub fn run() {
                             api.prevent_close();
                             crate::tray::hide_window(&app_handle);
                         }
-                        // 最小化/还原联动悬浮球：最小化也是主窗「视觉不可见」，
-                        // 球应出现。Windows 上最小化状态变化伴随 Resized 事件，借此
-                        // 检测（MAIN_WINDOW_VISIBLE 状态位只覆盖托盘/快捷键显隐链）
-                        tauri::WindowEvent::Resized(_) => {
+                        // 移动/缩放都记下来：此前只在「点 × 隐藏到托盘」（CloseRequested）
+                        // 时保存，长期驻留副屏、从不点 × 的用户一旦走升级重启
+                        // （relaunch_app 硬退，同样不走 CloseRequested），config 里还是
+                        // 很久以前的坐标，窗口就被恢复回老位置（主屏）。最小化/最大化
+                        // /不可见的过滤在 persist_window_state 内部做，这里只管触发。
+                        // 悬浮球联动沿用原 Resized 分支的最小化检测
+                        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
                             let minimized = win_for_events.is_minimized().unwrap_or(false);
                             crate::floating_ball::set_main_minimized(&app_handle, minimized);
+                            schedule_geometry_save(&app_handle);
                         }
                         _ => {}
                     }
@@ -758,6 +800,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_initial_data,
+            commands::list_resources,
             commands::create_resource,
             commands::update_resource,
             commands::get_resource_remark,
@@ -899,6 +942,10 @@ pub fn run() {
             commands::set_chat_session_model,
             commands::list_chat_messages,
             commands::send_chat_message,
+    commands::send_agent_message,
+    commands::respond_agent_approval,
+    commands::list_agent_approvals,
+    commands::cancel_agent_turn,
             commands::ai_transform_note,
             commands::get_chat_models,
             commands::save_chat_models,
@@ -1011,6 +1058,8 @@ pub fn run() {
             precheck::precheck_extension,
             // 平台 AI 额度（登录后可直接使用的模型列表）
             chat::platform_models,
+            // 供应商预设（「添加供应商」快速填充；后台可配）
+            chat::platform_provider_presets,
             market::get_market_registry,
             market::refresh_market_registry,
             market::install_from_market,
@@ -1043,8 +1092,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            // 宿主退出：停止所有 service 后端进程，避免 Node 子进程残留
+            // 宿主退出：保存窗口几何（托盘点「退出」路径，窗口隐藏时 persist 内部
+            // 自行跳过）+ 停止所有 service 后端进程，避免 Node 子进程残留
             if let tauri::RunEvent::Exit = event {
+                persist_window_state(app);
                 service::stop_all(app);
                 // 先显式移除托盘图标：set_visible/destroy 那类 API 会 run_on_main_thread 回投到
                 // 事件循环（本回调正在主线程里跑，投回去没人处理，就是当年「退出流程被拖死」的

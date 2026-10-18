@@ -210,10 +210,18 @@ const activeCatChips = computed(() =>
       : installedCatChips.value,
 )
 
-/** 已装扩展是否官方（优先市场清单标记；`com.x-hub.*` 前缀是平台保留命名空间，等价官方） */
+/**
+ * 已装扩展是否官方：**只认市场清单的服务端标记**（official 字段；老清单条目由
+ * isOfficialExt 的 com.x-hub.* 前缀兜底）。清单里查不到的一律不算官方。
+ *
+ * 为什么不对本地 manifest 单独做前缀兜底：官方标是「信任」问题——服务端关卡能拦住
+ * 第三方用保留命名空间**上架**，但拦不住谁在**本地**把 id 写成 com.x-hub.*（开发者自装、
+ * 「我的扩展」直挂都不过关卡）。前缀兜底只对市场条目成立（服务端背书），对本地条目
+ * 一放行，用户自己写的扩展就白捡一个官方标（2026-10-15 用户反馈案例）。
+ */
 function installedIsOfficial(e: ExtensionEntry): boolean {
   const m = marketById.value.get(e.id)
-  return isOfficialExt(m ?? e)
+  return !!m && isOfficialExt(m)
 }
 
 function accentFor(e: ExtensionEntry) {
@@ -1918,7 +1926,7 @@ function onMore(e: ExtensionEntry) {
   padding: 2px;
 }
 /* 已安装/可升级卡片紧凑版（只作用这两个标签页，市场卡维持原样）：
-   收内边距与纵向间距、图标/按钮缩一档、描述压到单行截断——卡片高度固定由内容决定，
+   收内边距与纵向间距、图标/按钮缩一档——卡片高度固定由内容决定，
    不随窗口高度变化（拉伸由 .ec-market-list 的 align-content: start 兜住） */
 .ec-scroll .ec-mcard {
   gap: 5px;
@@ -1930,7 +1938,11 @@ function onMore(e: ExtensionEntry) {
   font-size: 0.75rem;
 }
 .ec-scroll .ec-mcard-desc {
-  -webkit-line-clamp: 1;
+  /* 两行截断由基样式的 line-clamp:2 承担。这里用恰好两行高的 max-height 夹住裁剪边界：
+     WebView2 在小数缩放（125%）下会给 -webkit-box 的钳制盒高多算 1-2px（实测盒高 38px、
+     行距 18px），第三行字形上沿从缝里露出一条 2px 毛边；干净引擎里钳制内容高本就是 36px，
+     此条是无操作。勿再加 min-height 撑高——同会破坏裁剪边界（实测） */
+  max-height: calc(2 * 1.5em);
 }
 .ec-scroll .ec-tagline {
   min-height: 16px;

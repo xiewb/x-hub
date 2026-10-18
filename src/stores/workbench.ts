@@ -3,7 +3,7 @@ import { normalizeNoteEditorMode } from '../utils/noteEditorMode'
 import { compareByOrder, groupOf } from '../utils/todoSchedule'
 import { isHttpWebTarget } from '../utils/web'
 import {
-  tauriApi,
+  tauriApi as rawTauriApi,
   isTauri,
   type AppConfig,
   type ChatModelConfig,
@@ -29,6 +29,58 @@ import {
   type TodoTagLink,
   type WeatherCurrent,
 } from '../api/tauri'
+
+// ---- 自写回声去抖（0.9.0 审查优化）----
+// UI 写命令在 Rust 侧也广播 *-changed（与 agent 写库共用同一批事件）——本窗口刚写完
+// 又被自己的事件触发一次全量重拉。这里按「命令 → 数据域」打点，事件到达时落在短暂
+// 回声窗口内就跳过。未映射的命令不打点：agent/其它窗口的写入照常刷新，漏登记只是
+// 多拉一次（无害，fail-open）。
+const WRITE_CMD_DOMAIN: Record<string, string> = {
+  // todos / todo-tags
+  createTodo: 'todos', toggleTodo: 'todos', updateTodo: 'todos', deleteTodo: 'todos',
+  scheduleTodo: 'todos', reorderTodoOrders: 'todos', moveTodoChild: 'todos',
+  setTodoDescription: 'todos', setTodoPinned: 'todos', setTodoRepeat: 'todos',
+  completeTodoRecurring: 'todos', undoTodoRecurring: 'todos',
+  createTodoTag: 'todoTags', updateTodoTag: 'todoTags', deleteTodoTag: 'todoTags', setTodoTags: 'todoTags',
+  // notes（笔记/文件夹/标签的写都会触发 notes-changed 刷新链）
+  createNoteIn: 'notes', updateNote: 'notes', trashNote: 'notes', restoreNote: 'notes',
+  purgeNote: 'notes', deleteNote: 'notes', purgeAllTrashedNotes: 'notes',
+  renameTag: 'notes', deleteTag: 'notes',
+  createNoteFolder: 'notes', renameNoteFolder: 'notes', deleteNoteFolder: 'notes',
+  reorderNoteFolders: 'notes', setNoteFolder: 'notes', setNoteIcon: 'notes',
+  // snippets
+  createSnippet: 'snippets', updateSnippet: 'snippets', deleteSnippet: 'snippets',
+  toggleSnippetPin: 'snippets', recordSnippetCopy: 'snippets',
+  // stickies
+  saveSticky: 'stickies', detachSticky: 'stickies', saveDetachedSticky: 'stickies',
+  toggleDetachedStickyPin: 'stickies', restoreDetachedSticky: 'stickies', deleteDetachedSticky: 'stickies',
+  // countdowns
+  createCountdown: 'countdowns', updateCountdown: 'countdowns', deleteCountdown: 'countdowns',
+  resumeCountdown: 'countdowns', pauseCountdown: 'countdowns',
+  floatCountdown: 'countdowns', unfloatCountdown: 'countdowns',
+  // resources（资源/小类/分区写都会触发 resources-changed 刷新链）
+  createResource: 'resources', updateResource: 'resources', deleteResource: 'resources',
+  reorderResources: 'resources', launchResource: 'resources', openUrlWithBrowser: 'resources',
+  launchResourceAsAdmin: 'resources', revealResourceInExplorer: 'resources',
+  reorderResourcesZoned: 'resources', setResourcesZone: 'resources', openResourceInWindow: 'resources',
+  createSubcategory: 'resources', renameSubcategory: 'resources', deleteSubcategory: 'resources',
+  reorderSubcategories: 'resources', setDefaultSubcategory: 'resources',
+  createZone: 'resources', renameZone: 'resources', deleteZone: 'resources',
+  reorderZones: 'resources', setZoneScale: 'resources',
+}
+const SELF_WRITE_ECHO_MS = 150
+const selfWriteAt: Record<string, number> = {}
+function isSelfWriteEcho(domain: string): boolean {
+  return Date.now() - (selfWriteAt[domain] ?? 0) < SELF_WRITE_ECHO_MS
+}
+/** 打点代理：访问写命令即记下发时刻（读命令直通）。tauriApi 方法都是对象字面量箭头函数，无 this 依赖 */
+const tauriApi: typeof rawTauriApi = new Proxy(rawTauriApi, {
+  get(target, prop) {
+    const domain = WRITE_CMD_DOMAIN[String(prop)]
+    if (domain) selfWriteAt[domain] = Date.now()
+    return target[prop as keyof typeof target]
+  },
+})
 
 // 浏览器预览环境的兜底默认值；真实默认由 Rust 端 shortcut.rs 决定
 const IS_MAC_PREVIEW =
@@ -177,6 +229,11 @@ const state = reactive<StoreState>({
     floating_ball_x: null,
     floating_ball_y: null,
     floating_ball_idle_spin: false,
+    agent_permission_mode: 'ask',
+    agent_about_me: '',
+    agent_prompt_on_dangerous: false,
+    agent_ext_tools_enabled: true,
+    agent_ext_tool_grants: {},
   },
   systemInfo: null,
   online: false,
@@ -212,6 +269,44 @@ export function useStore() {
     void refreshSubcategories()
     // 速达分区单独拉（同上）
     void refreshZones()
+    setupDataChangeListeners()
+  }
+
+  // ---- 跨窗口数据刷新（0.9.0 修复）----
+  // agent 工具在 Rust 侧直接改库，改完广播 *-changed 事件（与 UI 命令同名）。
+  // 每个窗口订阅一份：AI 建的待办/笔记等立即出现在本窗口，其它窗口同样生效。
+  let changeListenersReady = false
+  function setupDataChangeListeners() {
+    if (changeListenersReady || !isTauri()) return
+    changeListenersReady = true
+    void import('@tauri-apps/api/event').then(({ listen }) => {
+      void listen('todos-changed', () => { if (!isSelfWriteEcho('todos')) void refreshTodos() })
+      void listen('todo-tags-changed', () => { if (!isSelfWriteEcho('todoTags')) void refreshTodoTags() })
+      void listen('notes-changed', () => {
+        if (isSelfWriteEcho('notes')) return
+        void refreshNotes()
+        void refreshNoteFolders()
+        void refreshNoteTagRows()
+      })
+      void listen('snippets-changed', () => { if (!isSelfWriteEcho('snippets')) void loadSnippets() })
+      void listen('stickies-changed', () => { if (!isSelfWriteEcho('stickies')) void refreshStickies() })
+      void listen('countdowns-changed', () => { if (!isSelfWriteEcho('countdowns')) void refreshCountdowns() })
+      void listen('resources-changed', () => {
+        if (isSelfWriteEcho('resources')) return
+        void refreshResources()
+        void refreshSubcategories()
+      })
+    })
+  }
+
+  /** 速达资源全量重拉（resources-changed：agent 建的资源/小类即时可见） */
+  async function refreshResources() {
+    if (!isTauri()) return
+    try {
+      state.resources = await tauriApi.listResources()
+    } catch {
+      // 拉取失败保持现状，不打扰
+    }
   }
 
   // ---- 提示词百宝箱 ----
@@ -1472,6 +1567,24 @@ export function useStore() {
     state.config.chat_models = models
   }
 
+  /** AI 助手权限与个性化（#t47）：默认权限档 / 完全权限档危险操作提示 / 关于我 / 扩展工具总开关。
+   *  只写传入的字段，一次落盘；后端 send_agent_message 未带快捷档时读这些值 */
+  async function setAgentSettings(patch: {
+    agent_permission_mode?: string
+    agent_about_me?: string
+    agent_prompt_on_dangerous?: boolean
+    agent_ext_tools_enabled?: boolean
+  }) {
+    if (patch.agent_permission_mode !== undefined) state.config.agent_permission_mode = patch.agent_permission_mode
+    if (patch.agent_about_me !== undefined) state.config.agent_about_me = patch.agent_about_me
+    if (patch.agent_prompt_on_dangerous !== undefined)
+      state.config.agent_prompt_on_dangerous = patch.agent_prompt_on_dangerous
+    if (patch.agent_ext_tools_enabled !== undefined)
+      state.config.agent_ext_tools_enabled = patch.agent_ext_tools_enabled
+    if (!isTauri()) return
+    await tauriApi.saveConfig(state.config)
+  }
+
   /** AI 对话面板透明度（0.5–1.0） */
   async function setChatPanelOpacity(value: number) {
     state.config.chat_panel_opacity = Math.min(1, Math.max(0.5, value))
@@ -1592,6 +1705,14 @@ export function useStore() {
   function setExtensionLinkMode(id: string, mode: string) {
     const modes = state.config.extension_link_modes ?? {}
     state.config.extension_link_modes = { ...modes, [id]: mode }
+    if (!isTauri()) return
+    void tauriApi.saveConfig(state.config)
+  }
+
+  /** 扩展 AI 工具授权：该扩展声明的 agent.tools 是否进入 AI 助手的聚合清单（缺省允许） */
+  function setExtensionAgentGrant(id: string, granted: boolean) {
+    const grants = state.config.agent_ext_tool_grants ?? {}
+    state.config.agent_ext_tool_grants = { ...grants, [id]: granted }
     if (!isTauri()) return
     void tauriApi.saveConfig(state.config)
   }
@@ -1882,6 +2003,7 @@ export function useStore() {
     revealResourceInExplorer,
     openResourceInBrowser,
     refreshSubcategories,
+    refreshResources,
     subcategoriesOf,
     defaultSubcategoryName,
     addSubcategory,
@@ -1983,6 +2105,7 @@ export function useStore() {
     setNoticeDuration,
     setClockQuote,
   setChatModels,
+  setAgentSettings,
   setChatPanelOpacity,
   setChatPanelSide,
   setChatWindowMode,
@@ -1997,6 +2120,7 @@ export function useStore() {
     setSidebarExtensionBulk,
     setExtensionOpenMode,
     setExtensionLinkMode,
+    setExtensionAgentGrant,
     setExtensionRowClick,
     setRunAtStartup,
     setFloatingBallEnabled,

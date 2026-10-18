@@ -289,6 +289,17 @@ export interface AppConfig {
   clock_quote: string // 时钟卡片语录（可配置，空串回退默认）
   notice_duration_ms: number // 右下角通知弹窗驻留时长（毫秒，1000–60000）
   online_enabled: boolean // 联网功能总开关（默认开）
+  /** AI 助手默认权限档：readonly（仅可查看）/ ask（每次都问，默认）/ full（完全权限）。
+   *  对话框快捷切换未手动调整时以此初始化；后端命令缺省回落同款安全默认 ask */
+  agent_permission_mode: string
+  /** 「关于我」自画像（Agent system prompt 第四段；空串 = 不注入该段） */
+  agent_about_me: string
+  /** 完全权限档下危险操作仍弹确认（子开关，默认关：完全权限 = 风险自担） */
+  agent_prompt_on_dangerous: boolean
+  /** AI 助手调用扩展工具的总开关（默认开）：关闭后扩展声明的 AI 工具整体退出聚合清单 */
+  agent_ext_tools_enabled: boolean
+  /** 每扩展授权（缺项 = 允许）：扩展设置弹窗「允许 AI 助手调用」写入 */
+  agent_ext_tool_grants?: Record<string, boolean>
   webview_mem_low_on_hide: boolean // 隐藏窗口降低内存占用（默认开）：隐藏时 WebView2 内存级别设 Low，显示前恢复 Normal
   weather_city: string // 天气城市展示名（空串 = 未配置）
   weather_lat: number // 天气纬度缓存
@@ -491,6 +502,20 @@ export interface ExtensionEntry {
   module_options: ExtensionModuleOptions
   /** 安装时间（目录创建时间，RFC3339；「已安装」列表按此排序，最后安装的在最下面） */
   installed_at: string | null
+  /** 声明给 AI 助手的工具（manifest.agent.tools 校验后的合格子集，空 = 未声明） */
+  agent_tools: ExtensionAgentTool[]
+}
+
+/** 扩展声明给 AI 助手的工具（后端 extension.rs::AgentToolDecl） */
+export interface ExtensionAgentTool {
+  name: string
+  description: string
+  /** AI 侧审批档：read / write / dangerous（与扩展 permissions 两套体系） */
+  level: 'read' | 'write' | 'dangerous'
+  /** 参数 JSON Schema（object；null = 无参） */
+  parameters: Record<string, unknown> | null
+  /** 返回值形状说明（空串 = 未声明） */
+  returns: string
 }
 
 /** 工作台模块选项（后端 extension.rs::ModuleOptions） */
@@ -634,6 +659,11 @@ export interface AccountStatus {
   role: string
   quotaTotal: number
   quotaRemaining: number
+  /** 积分账本（权威口径）：平台模型按 token 折算扣积分，1 次 ≈ 10 积分。
+   *  ⚠️ 字段名与后端 serde 序列化严格一致（account.rs 是 credit 单数）——
+   *  写成 credits 复数会静默读到 undefined（徽标曾显示「剩余 undefined 积分」） */
+  creditTotal: number
+  creditRemaining: number
   /** 已兑换邀请码（= 有权益：额度 + 可申请开发者） */
   inviteRedeemed: boolean
   /** none / pending / approved / rejected */
@@ -991,8 +1021,15 @@ export interface ChatSession {
 export interface ChatMessage {
   id: number
   session_id: number
-  role: 'user' | 'assistant'
+  /** 一次用户输入 = 一个 turn；时间线 UI 按它分组（M2+M3 起） */
+  turn_id?: string | null
+  role: 'user' | 'assistant' | 'tool'
   content: string
+  /** assistant 消息携带的工具调用请求（JSON 数组文本） */
+  tool_calls?: string | null
+  tool_call_id?: string | null
+  tool_name?: string | null
+  tool_status?: 'ok' | 'error' | 'denied' | 'cancelled' | null
   created_at: string
 }
 
@@ -1010,20 +1047,85 @@ export interface ChatModelConfig {
 /** 平台免费额度在界面上的单一入口名（与后端 `chat.rs::PLATFORM_ENTRY_NAME` 是同一个值，改动需两端同步） */
 export const PLATFORM_ENTRY_NAME = 'x-hub 平台'
 
+/** 供应商预设（后台 /admin/ai/provider-presets 可配；客户端拉取失败时回落内置清单） */
+export interface ProviderPreset {
+  name: string
+  baseUrl: string
+  /** 申请 API Key 的指引页（空 = 不显示「获取 Key」入口） */
+  keyGuideUrl: string
+  /** 备注说明（如免费额度、计费方式），空 = 无 */
+  note: string
+}
+
 /** 是否平台额度条目（写入时定死 `platform:` 前缀；旧条目可能只有 provider_name 标识，一并认） */
 export function isPlatformModel(m: ChatModelConfig): boolean {
   return m.id.startsWith('platform:') || (m.provider_name ?? '').trim() === PLATFORM_ENTRY_NAME
+}
+
+/** 一轮对话的 token 用量（agent 多轮工具循环为全部模型调用之和；字段与后端 ChatUsage 对齐） */
+export interface ChatUsage {
+  input: number
+  output: number
+  cache_read: number
+  reasoning: number
 }
 
 export type ChatStreamEvent =
   | { type: 'chunk'; content: string }
   | { type: 'done'; message: ChatMessage; session: ChatSession }
   | { type: 'error'; message: string; partial: string }
+  // ---- Agent 循环事件（#t44；工具卡片/时间线/审批卡片的渲染在 #t46）----
+  /** 回合已开始（turn_id 后端生成，开工即推）：停止键据此立刻可用 */
+  | { type: 'turnStart'; turnId: string }
+  /** 模型发起的工具调用已获准执行 */
+  | {
+      type: 'toolCall'
+      turnId: string
+      callId: string
+      name: string
+      /** 模型产出的参数 JSON 原文 */
+      args: string
+      /** read / write / dangerous */
+      level: string
+    }
+  /** 工具执行完毕（detail 为回给模型的完整结果，UI 折叠展示） */
+  | { type: 'toolResult'; callId: string; ok: boolean; summary: string; detail: string }
+  /** Ask 档等待用户确认；用 respondAgentApproval(callId, once|always|deny) 回答 */
+  | {
+      type: 'approvalRequest'
+      turnId: string
+      callId: string
+      name: string
+      args: string
+      level: string
+    }
+  /** 一轮对话（turn）收尾：最终回复已落库，usage 为全部模型调用之和 */
+  | {
+      type: 'turnDone'
+      turnId: string
+      message: ChatMessage
+      session: ChatSession
+      usage: ChatUsage
+      toolCount: number
+    }
+
+/** 挂起中的审批快照（listAgentApprovals 返回；字段与 approvalRequest 事件一致） */
+export interface AgentApprovalAsk {
+  sessionId: number
+  turnId: string
+  callId: string
+  name: string
+  args: string
+  /** read / write / dangerous */
+  level: string
+}
 
 export const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
 export const tauriApi = {
   getInitialData: () => invoke<InitialData>('get_initial_data'),
+  /** 速达资源全量清单（resources-changed 刷新用） */
+  listResources: () => invoke<Resource[]>('list_resources'),
   /** 轻量配置读取（AI 对话独立窗唤起用）：只拉 config，不拉九类业务数据 */
   getUiConfig: () => invoke<AppConfig>('get_ui_config'),
   createResource: (payload: {
@@ -1403,6 +1505,32 @@ export const tauriApi = {
     channel.onmessage = onEvent
     return invoke<void>('send_chat_message', { sessionId, content, onEvent: channel })
   },
+  /** Agent 模式发消息（#t44）：带工具循环；过程事件与 TurnDone 经 onEvent 推送。
+   *  permissionMode：readonly | ask | full（对话框快捷切换；缺省后端回落默认档） */
+  sendAgentMessage: (
+    sessionId: number,
+    content: string,
+    permissionMode: 'readonly' | 'ask' | 'full' | null,
+    onEvent: (e: ChatStreamEvent) => void,
+  ) => {
+    const channel = new Channel<ChatStreamEvent>()
+    channel.onmessage = onEvent
+    return invoke<void>('send_agent_message', {
+      sessionId,
+      content,
+      permissionMode,
+      onEvent: channel,
+    })
+  },
+  /** 回答工具审批（Ask 档内联卡片）：answer = once | always | deny（其他值一律按 deny）。
+   *  turnId 用于并发回合同 callId 撞车时精确路由 */
+  respondAgentApproval: (turnId: string, callId: string, answer: 'once' | 'always' | 'deny') =>
+    invoke<void>('respond_agent_approval', { turnId, callId, answer }),
+  /** 查询会话仍在等待确认的审批（面板重开/切回会话时还原 awaiting 卡片，0.9.0） */
+  listAgentApprovals: (sessionId: number) =>
+    invoke<AgentApprovalAsk[]>('list_agent_approvals', { sessionId }),
+  /** 用户中断 Agent 回合（已执行的工具不回滚，§4） */
+  cancelAgentTurn: (turnId: string) => invoke<void>('cancel_agent_turn', { turnId }),
   /** 笔记 AI 深度整理：无会话、不落库的一次性流式变换；返回值即完整结果（Chunk 经 onEvent 增量推送） */
   aiTransformNote: (content: string, onEvent: (e: ChatStreamEvent) => void) => {
     const channel = new Channel<ChatStreamEvent>()
@@ -1412,6 +1540,8 @@ export const tauriApi = {
   getChatModels: () => invoke<ChatModelConfig[]>('get_chat_models'),
   /** 平台可用模型（「使用平台免费额度」；需登录账号） */
   platformModels: () => invoke<string[]>('platform_models'),
+  /** 供应商预设（「添加供应商」快速填充；后台可配，需登录账号。失败时调用方回落内置清单） */
+  platformProviderPresets: () => invoke<ProviderPreset[]>('platform_provider_presets'),
   saveChatModels: (models: ChatModelConfig[]) => invoke<ChatModelConfig[]>('save_chat_models', { models }),
   fetchChatProviderModels: (baseUrl: string, apiKey: string, keyId?: string) =>
     invoke<string[]>('fetch_chat_provider_models', { baseUrl, apiKey, keyId }),
@@ -1428,7 +1558,8 @@ export const tauriApi = {
     invoke<void>('chat_window_set_pinned', { pinned }),
   chatWindowSaveMode: (enabled: boolean) =>
     invoke<void>('chat_window_save_mode', { enabled }),
-  chatWindowOpenSettings: () => invoke<void>('chat_window_open_settings'),
+  chatWindowOpenSettings: (section?: 'providers' | 'account') =>
+    invoke<void>('chat_window_open_settings', { section: section ?? 'providers' }),
   getAppInfo: () => invoke<AppInfo>('get_app_info'),
   createCountdown: (payload: {
     name: string

@@ -2296,6 +2296,7 @@ mod tests {
             config: Map::new(),
             module_variants: vec![],
             module_options: Default::default(),
+            agent: None,
         };
         assert!(declares(&manifest, "data:read"));
         assert!(!declares(&manifest, "data:write"));

@@ -85,6 +85,11 @@ pub fn platform_models_path() -> &'static str {
     "/api/v1/ai/models"
 }
 
+/// 供应商预设清单（GET；「添加供应商」快速填充用，后台可配）
+pub fn provider_presets_path() -> &'static str {
+    "/api/v1/ai/provider-presets"
+}
+
 // ---------------- 扩展发布 ----------------
 
 pub fn submit_extension_path() -> &'static str {
@@ -123,6 +128,7 @@ mod tests {
         assert_eq!(device_tokens_path(), "/api/v1/me/device-tokens");
         assert_eq!(device_revoke(b, 7).0, "https://x.example/api/v1/me/device-tokens/7/revoke");
         assert_eq!(platform_models_path(), "/api/v1/ai/models");
+        assert_eq!(provider_presets_path(), "/api/v1/ai/provider-presets");
         assert_eq!(submit_extension_path(), "/api/v1/dev/submissions");
         assert_eq!(submission_detail_path(9), "/api/v1/dev/submissions/9");
         assert_eq!(withdraw_submission(b, 9).0, "https://x.example/api/v1/dev/submissions/9/withdraw");

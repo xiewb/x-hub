@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// 账号大类（登录 / 额度 / 开发者申请 / 我的设备）
+// 账号大类（登录 / 兑换邀请码 / 开发者申请 / 我的设备）
+// （AI 额度（积分）展示 2026-10-16 挪到「AI 助手」大类 AiPanel.vue；兑换入口仍在本页）
 //
 // 平台服务端地址是内置常量（`config::DEFAULT_SERVER_URL`），设置里**不提供地址入口**：
 // 正式域名启用后用户无需也无法改地址（改地址只会让账号功能指向失效的服务端，见约定 52）。
@@ -584,19 +585,6 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="setting-row">
-              <div class="setting-info">
-                <span class="setting-name">AI 额度</span>
-                <span class="setting-desc">
-                  {{
-                    account.inviteRedeemed
-                      ? `剩余 ${account.quotaRemaining} 次（共 ${account.quotaTotal} 次）`
-                      : '尚未兑换邀请码，当前没有额度'
-                  }}
-                </span>
-              </div>
-            </div>
-
-            <div v-if="!account.inviteRedeemed" class="setting-row">
               <div class="setting-info">
                 <span class="setting-name">兑换邀请码</span>
                 <span class="setting-desc">兑换后才发放额度，并开放「申请成为开发者」</span>

@@ -17,6 +17,16 @@ pub fn init_in_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Agent 工具执行用短连接（#t44）：主连接被 DbState 互斥锁保护，而 agent 循环跨 await，
+/// 不能持锁执行工具。WAL 模式下多连接读写安全；工具执行频率远低于模型调用，
+/// 每次调用开一条短连接（本地文件，成本可忽略）换取零锁竞争。
+pub fn open_tool_connection() -> Result<Connection> {
+    let path = crate::paths::data_root().join("app.db");
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
+}
+
 fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -206,8 +216,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS chat_messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
-          role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+          -- 一次用户输入 = 一个 turn：时间线 UI 分组（§7）、上下文截断（§4）、服务端积分计费（§8）共用
+          turn_id TEXT,
+          role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
           content TEXT NOT NULL DEFAULT '',
+          -- assistant 消息携带的工具调用请求（JSON 数组 [{id, name, arguments}]）
+          tool_calls TEXT,
+          -- tool 消息：对应的调用 id / 工具名 / 结果状态（ok / error / denied）
+          tool_call_id TEXT,
+          tool_name TEXT,
+          tool_status TEXT,
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
         );
 
@@ -410,6 +428,62 @@ fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
     }
+
+    // ---- Agent 底座（#t42 / 计划 §6）：chat_messages 重建表 ----
+    // 老表 CHECK 只放行 user/assistant 且无 turn_id/tool_* 列，CHECK 无法 ALTER →
+    // 照 resources 重建表的既有模式：识别「无 turn_id 列」的老库，整表重建 + 老数据搬迁。
+    let chat_msg_cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(chat_messages)")?
+        .query_map([], |row| row.get(1))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    if !chat_msg_cols.iter().any(|c| c == "turn_id") {
+        // 整段包一个事务：SQLite DDL 可事务化，中途崩溃（断电/被杀）时整体回滚——
+        // 不包的话停在中间态（新表已带 turn_id 列）会让幂等判定跳过重建，
+        // 老数据永久滞留在 chat_messages_old 里无人再读
+        conn.execute_batch(
+            "
+            BEGIN;
+            ALTER TABLE chat_messages RENAME TO chat_messages_old;
+            CREATE TABLE chat_messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+              turn_id TEXT,
+              role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'tool')),
+              content TEXT NOT NULL DEFAULT '',
+              tool_calls TEXT,
+              tool_call_id TEXT,
+              tool_name TEXT,
+              tool_status TEXT,
+              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+            );
+            INSERT INTO chat_messages (id, session_id, turn_id, role, content, created_at)
+              SELECT id, session_id, NULL, role, content, created_at FROM chat_messages_old;
+            DROP TABLE chat_messages_old;
+
+            -- 老数据回填 turn：user 消息开新 turn（legacy_<id>），其后 assistant 归入
+            -- 最近一条 user 的 turn。老对话在时间线 UI（按 turn 分组）里同样成组；
+            -- 老库没有工具消息，tool_* 列保持 NULL。连跑两次时 turn_id 已非 NULL，天然幂等。
+            UPDATE chat_messages
+               SET turn_id = 'legacy_' || id
+             WHERE role = 'user' AND turn_id IS NULL;
+            UPDATE chat_messages
+               SET turn_id = 'legacy_' || (
+                     SELECT MAX(p.id) FROM chat_messages p
+                      WHERE p.session_id = chat_messages.session_id
+                        AND p.role = 'user' AND p.id <= chat_messages.id
+                   )
+             WHERE role = 'assistant' AND turn_id IS NULL;
+            COMMIT;
+            ",
+        )?;
+    }
+    // turn 索引在重建之后创建：重建把旧表连同其索引一起删了（session 索引也要补回）
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, id);
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_turn ON chat_messages(session_id, turn_id, id);
+        ",
+    )?;
 
     // 剪贴板历史从「纯文本」升级为「文本/图片/文件」三类型：逐列补齐（ALTER TABLE ADD COLUMN 幂等）
     let clip_cols: Vec<String> = conn
@@ -977,6 +1051,90 @@ mod tests {
         crate::repo::note::set_folder(&conn, notes[0].id, Some(f.id)).unwrap();
         let got = crate::repo::note::get(&conn, notes[0].id).unwrap();
         assert_eq!(got.folder_id, Some(f.id));
+    }
+
+    #[test]
+    fn legacy_chat_messages_rebuilds_and_backfills_turns() {
+        // Agent 底座（#t42）：老库 chat_messages（CHECK 只放行 user/assistant、无 turn_id/tool_*）
+        // 重建为新结构，老数据搬迁 + turn 回填（user 开 turn、assistant 跟随），连跑两次幂等；
+        // 新 CHECK 放行 role='tool'，turn 索引建立。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE chat_sessions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              title TEXT NOT NULL DEFAULT '新对话',
+              model_name TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+              updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+            );
+            CREATE TABLE chat_messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+              role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+              content TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+            );
+            CREATE INDEX idx_chat_messages_session ON chat_messages(session_id, id);
+            INSERT INTO chat_sessions (id, title) VALUES (1, '旧会话');
+            INSERT INTO chat_messages (id, session_id, role, content) VALUES
+              (1, 1, 'user', '你好'),
+              (2, 1, 'assistant', '你好！'),
+              (3, 1, 'user', '再问'),
+              (4, 1, 'assistant', '再答');
+            ",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap(); // 幂等
+
+        // 新列齐备
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(chat_messages)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        for col in ["turn_id", "tool_calls", "tool_call_id", "tool_name", "tool_status"] {
+            assert!(cols.iter().any(|c| c == col), "chat_messages 缺列 {col}");
+        }
+
+        // 老数据无损 + turn 回填成组
+        let rows: Vec<(i64, String, Option<String>)> = conn
+            .prepare("SELECT id, role, turn_id FROM chat_messages ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].2.as_deref(), Some("legacy_1"));
+        assert_eq!(rows[1].2, rows[0].2, "assistant 应跟随前一条 user 的 turn");
+        assert_eq!(rows[2].2.as_deref(), Some("legacy_3"));
+        assert_eq!(rows[3].2, rows[2].2);
+
+        // 新 CHECK 放行 role='tool'（老 CHECK 会拒绝）
+        conn.execute(
+            "INSERT INTO chat_messages (session_id, turn_id, role, content, tool_call_id, tool_name, tool_status)
+             VALUES (1, 'turn_x', 'tool', '[]', 'call_1', 'list_todos', 'ok')",
+            [],
+        )
+        .unwrap();
+
+        // turn 索引存在（重建会连带删掉旧索引，迁移后必须补回）
+        for idx in ["idx_chat_messages_session", "idx_chat_messages_turn"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    params![idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "缺索引 {idx}");
+        }
     }
 
     #[test]
