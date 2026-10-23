@@ -13,6 +13,7 @@ import { listen } from '@tauri-apps/api/event'
 import {
   FolderCog,
   FolderOpen,
+  Inbox,
   MoreVertical,
   PackageOpen,
   Play,
@@ -30,10 +31,13 @@ import {
   type MarketExtension,
   type MarketStatus,
   type ExtensionEntry,
+  type FeedbackUnread,
+  type PublishQuota,
 } from '../api/tauri'
 import { accentOf, iconSrc } from '../composables/useResourceIcon'
 import { loadExtensionModules } from '../composables/useDashboardLayout'
 import { useAdaptivePolling } from '../composables/useAdaptivePolling'
+import { useQuotaReset } from '../composables/useQuotaReset'
 import { useStore } from '../stores/workbench'
 import {
   CATEGORY_ALL,
@@ -45,6 +49,7 @@ import {
 import ExtensionSettingsDialog from './ExtensionSettingsDialog.vue'
 import MarketDetailDialog from './MarketDetailDialog.vue'
 import ExtensionPublishDialog from './ExtensionPublishDialog.vue'
+import ExtensionFeedbackInbox from './ExtensionFeedbackInbox.vue'
 import AppSelect from './AppSelect.vue'
 
 const showToast = inject<(msg: string, action?: { label: string; onClick: () => void }) => void>(
@@ -284,9 +289,7 @@ async function openDir(e: ExtensionEntry) {
 }
 
 /** 发布配额（账号级）：展示在扩展管理页，供发布前心里有数；取不到就不显示，不打扰 */
-const quota = ref<{ drafts_remaining?: number; published_remaining?: number; daily_submits_remaining?: number } | null>(
-  null,
-)
+const quota = ref<PublishQuota | null>(null)
 
 async function loadQuota() {
   if (!isTauri()) return
@@ -298,6 +301,13 @@ async function loadQuota() {
     // 未登录 / 服务不可达：静默（配额只是参考信息，不挡任何操作）
   }
 }
+
+/** 每日额度重置时刻：只在「今日次数已用完」时才需要倒计时。
+ *  没耗尽时不启动 1s tick，配额正常时零定时器开销；到点自动重拉配额。 */
+const dailyResetAt = computed(() =>
+  quota.value?.daily_submits_remaining === 0 ? quota.value.daily_reset_at ?? null : null,
+)
+const { countdown: resetCountdown, resetClock } = useQuotaReset(dailyResetAt, () => void loadQuota())
 
 async function load() {
   loading.value = true
@@ -358,6 +368,23 @@ async function pollStamp() {
 // 目录扫描是重量级 FS + IPC：可见且聚焦 5s，失焦/隐藏完全停——扩展文件只会在用户
 // 于本窗口操作时变化，失焦期间不可能变；从停止恢复时立即补扫一次（useAdaptivePolling）。
 useAdaptivePolling(pollStamp, { activeMs: 5000 })
+
+// ---- 用户反馈未读（「我的扩展」tab 红点 + 收件箱入口） ----
+// 反馈由平台托管（见 docs/adr 与 AGENTS.md 约定）：这里只轮询「我发布的扩展有没有新反馈」。
+// 60s 一次而不是跟目录戳的 5s —— 反馈不是实时性数据，别让扩展中心常驻每分钟多次网络请求。
+// 未登录 / 网络不可达一律静默：红点是辅助提示，不该打扰主流程。
+const feedbackUnread = ref<FeedbackUnread>({ total: 0, extensions: [] })
+const feedbackInboxOpen = ref(false)
+
+async function pollFeedbackUnread() {
+  if (!isTauri()) return
+  try {
+    feedbackUnread.value = await tauriApi.feedbackInboxUnread()
+  } catch {
+    /* 静默 */
+  }
+}
+useAdaptivePolling(pollFeedbackUnread, { activeMs: 60000 })
 
 function onInstall() {
   switchTab('market')
@@ -900,6 +927,11 @@ function onMore(e: ExtensionEntry) {
             @click="switchTab('dev')"
           >
             我的扩展
+            <!-- 红点：有未读反馈时提醒（收件箱开着时隐藏，用户正在看） -->
+            <span
+              v-if="feedbackUnread.total > 0 && !feedbackInboxOpen"
+              class="ec-tab-dot"
+            ></span>
           </button>
         </div>
       </div>
@@ -921,6 +953,17 @@ function onMore(e: ExtensionEntry) {
           </button>
         </template>
         <template v-if="tab === 'dev'">
+          <button
+            class="ghost-btn ec-feedback-btn"
+            type="button"
+            @click="feedbackInboxOpen = true"
+          >
+            <Inbox :size="14" :stroke-width="2" aria-hidden="true" />
+            用户反馈
+            <span v-if="feedbackUnread.total > 0" class="ec-feedback-badge">
+              {{ feedbackUnread.total }}
+            </span>
+          </button>
           <button class="pill-btn" type="button" :disabled="devBusy" @click="pickDevDir">
             <FolderCog :size="14" :stroke-width="2" aria-hidden="true" />
             选择目录
@@ -1149,6 +1192,14 @@ function onMore(e: ExtensionEntry) {
           <b :class="{ full: quota.drafts_remaining === 0 }">{{ quota.drafts_remaining ?? '—' }}</b> 条 · 今日还可提交
           <b :class="{ full: quota.daily_submits_remaining === 0 }">{{ quota.daily_submits_remaining ?? '—' }}</b> 次 · 在架还可新增
           <b :class="{ full: quota.published_remaining === 0 }">{{ quota.published_remaining ?? '—' }}</b> 个
+          <!-- 每日额度用尽时给倒计时：服务端只在配额视图里回 daily_reset_at（旧服务端没有该字段，
+               此时不显示，退回「今天不能再发」的原文案）。到点由 useQuotaReset 自动重拉配额。 -->
+          <span
+            v-if="quota.daily_submits_remaining === 0 && quota.daily_reset_at"
+            class="ec-quota-reset"
+          >
+            今日提交次数已用完 · 重置于 {{ resetClock }}（{{ resetCountdown }}）
+          </span>
         </p>
       </div>
 
@@ -1410,6 +1461,12 @@ function onMore(e: ExtensionEntry) {
 
     <!-- 发布扩展：本机打包 → 上传平台 → 展示服务端返回的关卡逐项结论（客户端只问不判） -->
     <ExtensionPublishDialog :extension="publishTarget" @close="publishTarget = null" />
+
+    <!-- 用户反馈收件箱：我发布的扩展收到的公开反馈（回复 / 标记已解决 / 隐藏） -->
+    <ExtensionFeedbackInbox
+      v-model:visible="feedbackInboxOpen"
+      @read="pollFeedbackUnread"
+    />
   </div>
 </template>
 
@@ -1465,6 +1522,21 @@ function onMore(e: ExtensionEntry) {
   height: 7px;
   border-radius: 50%;
   background: var(--c-red);
+}
+/* 「我的扩展」页的反馈入口：未读计数药丸跟在按钮文字后 */
+.ec-feedback-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ec-feedback-badge {
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1.5;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--c-red);
+  color: #fff;
 }
 /* 分类筛选行：全部 + 各分类，单选，样式口径与标签页一致但更轻 */
 .ec-cats {
@@ -1526,6 +1598,14 @@ function onMore(e: ExtensionEntry) {
 }
 .ec-quota b.full {
   color: var(--c-red-ink);
+}
+/* 每日额度用尽后的重置倒计时：单独一行，不与「剩余数量」混排 */
+.ec-quota-reset {
+  display: block;
+  margin-top: 2px;
+  font-weight: 600;
+  color: var(--c-red-ink);
+  font-variant-numeric: tabular-nums;
 }
 
 .ec-empty {

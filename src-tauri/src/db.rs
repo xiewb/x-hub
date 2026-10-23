@@ -64,7 +64,7 @@ fn migrate(conn: &Connection) -> Result<()> {
           content TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
           updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
-          deleted_at TEXT
+          sort_order INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS tags (
@@ -503,15 +503,6 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
-    // 速记垃圾箱：notes 表补 deleted_at 列（软删除标记，ALTER TABLE ADD COLUMN 幂等）
-    let note_cols: Vec<String> = conn
-        .prepare("PRAGMA table_info(notes)")?
-        .query_map([], |row| row.get(1))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    if !note_cols.iter().any(|c| c == "deleted_at") {
-        conn.execute("ALTER TABLE notes ADD COLUMN deleted_at TEXT", [])?;
-    }
-
     // 倒计时表补 auto_paused 列（工作台卡片不可见时的自动冻结标记，ALTER TABLE ADD COLUMN 幂等）
     let cd_cols: Vec<String> = conn
         .prepare("PRAGMA table_info(countdowns)")?
@@ -539,6 +530,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !todo_cols.iter().any(|c| c == "remind_fired") {
         conn.execute(
             "ALTER TABLE todos ADD COLUMN remind_fired INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    // 提醒通知方式（弹窗/声音组合；'' = 老数据按 popup 处理，历史行为零变化）
+    if !todo_cols.iter().any(|c| c == "remind_notify_mode") {
+        conn.execute(
+            "ALTER TABLE todos ADD COLUMN remind_notify_mode TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }
@@ -688,6 +686,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     // 笔记自定义树图标（emoji，用户在标题旁设置；NULL = 默认文件图标）
     if !note_cols.iter().any(|c| c == "icon") {
         conn.execute("ALTER TABLE notes ADD COLUMN icon TEXT", [])?;
+    }
+    // 笔记手动排序位（组内拖拽；NULL = 未手动排序，同 todos.sort_order 口径）
+    if !note_cols.iter().any(|c| c == "sort_order") {
+        conn.execute("ALTER TABLE notes ADD COLUMN sort_order INTEGER", [])?;
     }
     // 标签内置位（「剪藏」标签不可改删；老库无此列）
     let tag_cols: Vec<String> = conn
