@@ -12,12 +12,14 @@ import { Fragment, Slice, type Node as ProseNode, type Schema } from '@milkdown/
 import type { EditorView } from '@milkdown/kit/prose/view'
 import { NodeSelection, TextSelection, type EditorState } from '@milkdown/kit/prose/state'
 import { Code2, Columns2, Copy, Eye, Link2, PencilLine, Plus, Smile, Sparkles, Tag as TagIcon, WandSparkles, Waypoints, X } from 'lucide-vue-next'
-import { isTauri, tauriApi, type Note, type NoteLinks, type Tag } from '../api/tauri'
+import { isPlatformModel, isTauri, tauriApi, PLATFORM_ENTRY_NAME, type Note, type NoteLinks, type Tag } from '../api/tauri'
+import { cleanModelMarkdownNoise } from '../utils/markdownLines'
 import { useStore } from '../stores/workbench'
 import { normalizeShortcutDisplay } from '../composables/useShortcutRecorder'
 import { attachBlockDrag } from '../utils/blockDrag'
+import { guessCodeLanguage, looksLikeCode, unwrapFencedCode } from '../utils/pasteCode'
 import { beautifyNoteMarkdown } from '../utils/markdownBeautify'
-import { fragmentToPlainText } from '../utils/clipboardPlainText'
+import { copyPlainText } from '../utils/clipboardPlainText'
 import { restoreNoteImageSyntax } from '../utils/noteImageSyntax'
 import { expandOnEnter, matchWysiwygLine, type LineShortcut } from '../utils/markdownEnter'
 import { loosenHtmlBreaks, renderNoteMarkdown, restoreCrepeMarkdown } from '../utils/markdownHtml'
@@ -37,7 +39,8 @@ import ContextMenu, { type ContextMenuItem } from './ContextMenu.vue'
  * |列x行| 或表头行生成表格。实时预览里回车同样把 #、>、-、1.、---、- [ ]、- [x] 收成标题、引用、列表、分隔线和任务。
  * 图片（粘贴/拖拽/点击上传）统一由 Crepe 的上传管线处理：plugin-upload 的 handlePaste/
  * handleDrop + ImageBlock 的 onUpload 配置 → saveNoteImageFile（notes/images + xhub-note 协议）。
- * 注意勿再自建 DOM paste 监听——plugin-upload 已处理粘贴，叠加监听会导致图片重复插入。
+ * DOM paste 监听仅限 attachCodePasteListener 一处（粘贴自动成码，capture 阶段、文件剪贴板
+ * 第一步放行、preventDefault 只发生在成码路径）——再自建处理图片/富文本的 paste 监听会导致重复插入。
  * 块拖拽（六点把手）为指针实现（utils/blockDrag.ts），绕开 Tauri 原生拖放对 HTML5 DnD 的拦截。
  */
 
@@ -104,6 +107,8 @@ let detachImageListeners: () => void = () => {}
 /** [[ 双链监听解绑函数与补全浮层状态：同理必须声明在 immediate watch 之前（watch 回调经
  * destroyEditor 触达，后置声明 = ReferenceError: Cannot access ... before initialization，实测踩过） */
 let detachWikiListeners: () => void = () => {}
+/** 粘贴自动成码监听解绑函数（attachCodePasteListener 内赋值）：同上必须先于 immediate watch 声明 */
+let detachPasteListener: () => void = () => {}
 const wikiSuggest = ref<WikiSuggest | null>(null)
 /** [[ 补全浮层的 <ul>（Teleport 到 body）；键盘上下键时用它把选中项滚进可视区 */
 const wikiListEl = ref<HTMLUListElement | null>(null)
@@ -153,6 +158,7 @@ async function destroyEditor() {
   // 再也调不到，表现为「切 N 次笔记后一次回车跑 N 遍」。
   detachImageListeners()
   detachWikiListeners()
+  detachPasteListener()
   wikiSuggest.value = null
   const c = crepe
   crepe = null
@@ -304,9 +310,12 @@ async function mountEditor(content: string) {
       view.setProps({
         // 仅预览与实时预览共用实例：只读态在此一并挂上（切换时 applyEditable 再显式刷新）
         editable: () => mode.value === 'wysiwyg',
-        clipboardTextSerializer: (slice) => fragmentToPlainText(slice.content),
+        // 段内选区（复制账号/密码等单个内容）→ 纯文本不带列表圆点等块级标记；
+        // 跨块选区（拖多行 / Ctrl+A 整体复制）→ 保留列表结构，见 copyPlainText
+        clipboardTextSerializer: (slice, view) => copyPlainText(slice, view.state.selection),
       })
       detachBlockDrag = attachBlockDrag(() => view)
+      if (rootEl.value) detachPasteListener = attachCodePasteListener(rootEl.value, view)
     })
     // 已缓存的图片不会再次触发 load：挂载完成后先按 attrs 同步一次宽度
     syncImageWidths()
@@ -324,6 +333,50 @@ async function mountEditor(content: string) {
       queuedMarkdown = null
     }
   }
+}
+
+// ---- 粘贴自动成码：从其它 AI/编辑器复制的裸代码（无 ``` 围栏）粘进正文只会落成普通段落 ----
+// capture 阶段挂在 Crepe 根容器上，先于 ProseMirror 的 paste 处理；判定为代码才
+// preventDefault + stopPropagation 接管成代码块，其余（图片/富文本/Markdown/围栏混合文本）
+// 全部放行走默认管线。判定与语言猜测是纯函数（utils/pasteCode.ts，tests 锁口径）。
+/** 把文本插为 code_block，光标落块内末尾；单事务 = 一步 Ctrl+Z 可整体撤销 */
+function insertPastedCodeBlock(view: EditorView, code: string, language: string) {
+  const schema = view.state.schema
+  const codeBlockType = schema.nodes.code_block
+  if (!codeBlockType) return
+  const node = codeBlockType.create({ language }, code ? schema.text(code) : undefined)
+  let tr = view.state.tr.replaceSelectionWith(node)
+  const $from = tr.selection.$from
+  if ($from.nodeBefore?.type === codeBlockType) {
+    tr = tr.setSelection(TextSelection.create(tr.doc, $from.pos - 1))
+  }
+  view.dispatch(tr.scrollIntoView())
+}
+
+function attachCodePasteListener(root: HTMLElement, view: EditorView): () => void {
+  const onPaste = (event: ClipboardEvent) => {
+    if (event.defaultPrevented || !view.editable) return
+    const cd = event.clipboardData
+    // 图片/文件剪贴板第一步放行：上传管线（plugin-upload）独占处理，勿在此劫持（约定 38）
+    if (!cd || cd.files.length > 0 || cd.types.includes('Files')) return
+    const target = event.target
+    if (!(target instanceof Node) || !view.dom.contains(target)) return
+    // 图注输入框、链接气泡输入框等编辑器内嵌 input 的粘贴保持原生
+    if (target instanceof Element && target.closest('input, textarea')) return
+    // 已在代码块内：按默认纯文本插入（粘进代码块就该是裸文本）
+    if (view.state.selection.$from.parent.type.spec.code) return
+    const text = cd.getData('text/plain')
+    if (!text) return
+    const fenced = unwrapFencedCode(text)
+    if (!fenced && !looksLikeCode(text)) return
+    event.preventDefault()
+    event.stopPropagation()
+    const code = fenced ? fenced.code : text.replace(/\n+$/, '')
+    const language = fenced ? fenced.language : guessCodeLanguage(code)
+    insertPastedCodeBlock(view, code, language)
+  }
+  root.addEventListener('paste', onPaste, true)
+  return () => root.removeEventListener('paste', onPaste, true)
 }
 
 // ---- 分屏预览：右侧挂一个只读 Crepe（同一渲染器 = 与编辑/仅预览格式一致），源码侧防抖同步 ----
@@ -375,9 +428,9 @@ async function mountSplitPreview(content: string) {
     c.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx)
       view.setProps({
-        // 只读预览；复制序列化与主编辑区同款所见即所得口径
+        // 只读预览；复制序列化与主编辑区同款所见即所得口径（段内无标记 / 跨块保留结构）
         editable: () => false,
-        clipboardTextSerializer: (slice) => fragmentToPlainText(slice.content),
+        clipboardTextSerializer: (slice, view) => copyPlainText(slice, view.state.selection),
       })
     })
     // 链接点击（外链/笔记双链）与图片灯箱与主编辑区同一套委托；[[跳转分支自带 mode 守卫
@@ -1144,15 +1197,15 @@ const aiSource = ref('')
  *  置回 false 会让旧请求的增量与返回值串进新流（旧结果覆盖新结果） */
 let aiRequestSeq = 0
 
-/** 弹层展示与应用共用这一份口径：先剥模型自加的外层围栏，再按原稿回收被压扁的图片语法。
- *  少任何一步都会让「预览看着对、应用下去图片没了」或反之 */
-const aiMarkdown = computed(() =>
-  restoreNoteImageSyntax(aiSource.value, unwrapModelMarkdown(aiResult.value)),
-)
+/** 弹层展示与应用共用这一份口径：先剥模型自加的外层围栏，再回收模型添的转义噪声
+ *  （`\_`/`\~`/`&#x20;`，见 cleanModelMarkdownNoise），最后按原稿回收被压扁的图片语法。
+ *  少任何一步都会让「预览看着对、应用下去图片没了」或源码被转义垃圾污染 */
+const aiModelClean = computed(() => cleanModelMarkdownNoise(unwrapModelMarkdown(aiResult.value)))
+const aiMarkdown = computed(() => restoreNoteImageSyntax(aiSource.value, aiModelClean.value))
 /** 回收确实改动了模型输出 = 模型又写坏了图片语法（提示词没拦住），应用时给用户一句交代，
  *  而不是悄悄改掉他要应用的内容 */
 const aiImagesRestored = computed(
-  () => aiState.value === 'done' && aiMarkdown.value !== unwrapModelMarkdown(aiResult.value),
+  () => aiState.value === 'done' && aiMarkdown.value !== aiModelClean.value,
 )
 const aiPreviewHtml = computed(() => renderNoteMarkdown(aiMarkdown.value))
 
@@ -1172,6 +1225,50 @@ type AiScope = 'full' | 'selection'
 const aiScope = ref<AiScope>('full')
 const aiDocRange = ref<{ from: number; to: number; inline: boolean } | null>(null)
 const aiTextRange = ref<{ start: number; end: number } | null>(null)
+
+/** 整理实际将使用的模型（设置「功能 → 速记」的 note_ai_model 的展示镜像；''=自动档走通用文案）。
+ *  后端 ai_transform_note 自行按配置解析模型，这里只做同口径的展示，解析失败静默回落通用文案 */
+const aiModelLabel = ref('')
+async function resolveAiModelLabel() {
+  const v = store.state.config.note_ai_model ?? ''
+  try {
+    if (!v) {
+      aiModelLabel.value = ''
+    } else if (v === PLATFORM_ENTRY_NAME) {
+      aiModelLabel.value = 'x-hub 平台（自动负载切换）'
+    } else if (v.startsWith('platform:')) {
+      aiModelLabel.value = `${v.slice('platform:'.length)}（平台）`
+    } else {
+      const m = (await tauriApi.getChatModels()).find((x) => !isPlatformModel(x) && x.name === v)
+      aiModelLabel.value = m ? `${m.name}（${m.provider_name || '未命名供应商'}）` : ''
+    }
+  } catch {
+    aiModelLabel.value = ''
+  }
+}
+const aiPrivacyText = computed(() => {
+  const scope = aiScope.value === 'selection' ? '选中片段' : '笔记全文'
+  const target = aiModelLabel.value || '你配置的 AI 模型'
+  const tail =
+    aiScope.value === 'selection' ? '应用后只替换选中部分，可 Ctrl+Z 一步撤销' : '应用后可 Ctrl+Z 一步撤销'
+  return `${scope}将发送给 ${target} 做语义重排；应用前不会改动笔记，${tail}。`
+})
+
+/** 复制整理结果（不动笔记）：给「只想拿走结果、贴去别处」的用户；按钮短暂变「已复制」做反馈 */
+const aiCopied = ref(false)
+let aiCopiedTimer: ReturnType<typeof setTimeout> | null = null
+async function copyAiResult() {
+  const text = aiMarkdown.value
+  if (aiState.value !== 'done' || !text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    aiCopied.value = true
+    if (aiCopiedTimer) clearTimeout(aiCopiedTimer)
+    aiCopiedTimer = setTimeout(() => (aiCopied.value = false), 1500)
+  } catch (e) {
+    showToast?.(`复制失败：${typeof e === 'string' ? e : String(e)}`)
+  }
+}
 
 interface AiSelectionCapture {
   markdown: string
@@ -1236,7 +1333,9 @@ async function openAiTransform() {
   aiSource.value = current
   aiResult.value = ''
   aiError.value = ''
+  aiCopied.value = false
   aiState.value = 'streaming'
+  void resolveAiModelLabel()
   try {
     const full = await tauriApi.aiTransformNote(current, (e) => {
       if (e.type === 'chunk' && seq === aiRequestSeq) aiResult.value += e.content
@@ -2670,13 +2769,7 @@ function onEditorAreaMouseDown(e: MouseEvent) {
               <X :size="14" :stroke-width="2" />
             </button>
           </header>
-          <p class="ai-privacy">
-            {{
-              aiScope === 'selection'
-                ? '选中片段将发送给你配置的 AI 模型做语义重排；应用前不会改动笔记，应用后只替换选中部分，可 Ctrl+Z 一步撤销。'
-                : '笔记全文将发送给你配置的 AI 模型做语义重排；应用前不会改动笔记，应用后可 Ctrl+Z 一步撤销。'
-            }}
-          </p>
+          <p class="ai-privacy">{{ aiPrivacyText }}</p>
           <div class="ai-body" aria-live="polite">
             <p v-if="aiState === 'streaming' && !aiResult" class="ai-status">正在整理…</p>
             <div v-else class="ai-preview md-preview" v-html="aiPreviewHtml"></div>
@@ -2690,6 +2783,14 @@ function onEditorAreaMouseDown(e: MouseEvent) {
             <span v-else class="ai-streaming-hint"></span>
             <div class="ai-foot-actions">
               <button class="ai-btn" type="button" @click="closeAiDialog">取消</button>
+              <button
+                class="ai-btn"
+                type="button"
+                :disabled="aiState !== 'done' || !aiMarkdown"
+                @click="copyAiResult"
+              >
+                {{ aiCopied ? '已复制' : '复制' }}
+              </button>
               <button
                 class="ai-btn primary"
                 type="button"

@@ -98,6 +98,8 @@ export interface Note {
   deleted_at: string | null
   /** 自定义树图标（emoji，null = 默认文件图标） */
   icon: string | null
+  /** 组内手动排序位（拖拽排序；null = 未手动排序） */
+  sort_order: number | null
 }
 
 export interface Todo {
@@ -114,6 +116,8 @@ export interface Todo {
   remind_at: number | null
   /** 提醒是否已触发（后台到点发过通知即置真） */
   remind_fired: boolean
+  /** 提醒通知方式：both=弹窗+声音 / popup=仅弹窗 / sound=仅声音 / none=静默；''=老数据按 popup 处理 */
+  remind_notify_mode: string
   /** 父待办 id（子待办），顶级为 null */
   parent_id: number | null
   /** 手动拖拽排序位（分组内升序）；null = 未手动排序，按创建时间倒序 */
@@ -370,6 +374,8 @@ export interface AppConfig {
   font_todo: number
   /** 速记编辑器模式：wysiwyg（实时预览）/ split（分屏预览）/ source（源码） */
   note_editor_mode: string
+  /** 速记 AI 深度整理模型：''=自动 / 'x-hub 平台'=平台负载切换 / 'platform:<名>'=指定平台模型 / 其余=自备模型名 */
+  note_ai_model: string
   /** 速记回收站保留天数（0 = 永久保留，默认）。启动时与设置变更时按此清理 */
   note_trash_retention_days: number
   /** service 扩展运行时策略：auto / builtin / system */
@@ -609,6 +615,15 @@ export interface AccountDevice {
   current?: boolean
 }
 
+/** 发布配额（服务端只回剩余次数与每日重置时刻，不回上限） */
+export interface PublishQuota {
+  drafts_remaining?: number
+  published_remaining?: number
+  daily_submits_remaining?: number
+  /** 每日提交额度的重置时刻（epoch ms，服务端本地自然日 0 点）；旧服务端没有该字段 */
+  daily_reset_at?: number
+}
+
 /** 发布提交结果（关卡逐项结论；客户端只展示服务端结论，不内置任何审核规则） */
 export interface SubmitResult {
   id: number
@@ -619,7 +634,7 @@ export interface SubmitResult {
   extId: string
   version: string
   /** 剩余配额（服务端只回剩余次数，不回上限） */
-  quota: { drafts_remaining?: number; published_remaining?: number; daily_submits_remaining?: number } | null
+  quota: PublishQuota | null
 }
 
 /** 我的一条提交记录 */
@@ -646,7 +661,7 @@ export interface DevSubmissionDetail extends DevSubmissionRow {
 export interface DevSubmissionList {
   submissions: DevSubmissionRow[]
   total: number
-  quota: { drafts_remaining?: number; published_remaining?: number; daily_submits_remaining?: number }
+  quota: PublishQuota
 }
 
 /** 平台账号状态（后端 account.rs::AccountStatus） */
@@ -765,6 +780,55 @@ export interface MarketStatus {
   error: string | null
   /** 撤销列表（`id@version`）：已装扩展命中则警示并停止自动更新（不静默卸载/禁用） */
   revoked: string[]
+}
+
+/** 扩展反馈类型（提交时三选一） */
+export type ExtensionFeedbackKind = 'bug' | 'idea' | 'question'
+
+/**
+ * 一条扩展反馈（后端 feedback.rs::ExtensionFeedback）。
+ * 公开列表接口不返回 contact / diagnostics / app_version / hidden —— 那几个字段只给开发者收件箱。
+ */
+export interface ExtensionFeedback {
+  id: number
+  kind: ExtensionFeedbackKind
+  /** 提交时的展示名；null = 匿名 */
+  author_name: string | null
+  body: string
+  /** open（待处理）/ replied（已回复）/ resolved（已解决） */
+  status: 'open' | 'replied' | 'resolved'
+  /** 开发者公开回复 */
+  reply: string | null
+  replied_at: number | null
+  /** 提交时的扩展版本（老数据可能为空） */
+  ext_version: string | null
+  created_at: number
+  // ---- 仅开发者收件箱返回 ----
+  /** 联系方式（仅开发者与平台管理员可见） */
+  contact?: string | null
+  /** 诊断信息（仅开发者与平台管理员可见） */
+  diagnostics?: string | null
+  app_version?: string | null
+  hidden?: boolean
+}
+
+/** 收件箱里一个已发布扩展的未读数（feedback_inbox_unread 返回） */
+export interface FeedbackUnreadExtension {
+  ext_id: string
+  name: string
+  version: string
+  unread: number
+}
+
+export interface FeedbackUnread {
+  total: number
+  extensions: FeedbackUnreadExtension[]
+}
+
+/** 公开反馈列表的一页（total = 全部条数，不受 limit 截断） */
+export interface ExtensionFeedbackPage {
+  total: number
+  items: ExtensionFeedback[]
 }
 
 /** 扩展打包结果（pack_extension_archive 返回） */
@@ -1263,6 +1327,8 @@ export const tauriApi = {
     invoke<void>('reorder_note_folders', { moves }),
   setNoteFolder: (noteId: number, folderId: number | null) =>
     invoke<void>('set_note_folder', { noteId, folderId: folderId ?? null }),
+  /** 笔记组内拖拽排序：ids 顺序即目标分组（文件夹/树根）的完整新顺序 */
+  reorderNoteOrders: (ids: number[]) => invoke<void>('reorder_note_orders', { ids }),
   /** 设置/清除笔记自定义树图标（emoji；icon=null 恢复默认） */
   setNoteIcon: (id: number, icon: string | null) => invoke<void>('set_note_icon', { id, icon }),
   /** 一键清空回收站（不可恢复，调用方先确认），返回清除条数 */
@@ -1273,7 +1339,28 @@ export const tauriApi = {
   rebuildNoteLinks: () => invoke<void>('rebuild_note_links'),
   // ---- 速记导出/导入（限自有产物） ----
   exportNotes: (dir: string) =>
-    invoke<{ exported: number; images: number; failed: string[]; dir: string }>('export_notes', { dir }),
+    invoke<{ exported: number; images: number; failed: string[]; dir: string; cancelled?: boolean }>('export_notes', { dir }),
+  /** 随手导出单条：format = markdown | html | pdf（html/pdf 需传前端渲染好的 bodyHtml） */
+  exportNoteFile: (id: number, path: string, format: 'markdown' | 'html' | 'pdf', bodyHtml?: string) =>
+    invoke<{ exported: number; failed: string[]; dir: string }>('export_note_file', {
+      id,
+      path,
+      format,
+      bodyHtml: bodyHtml ?? null,
+    }),
+  /** 整夹导出：落 <dir>/<文件夹名>/，每条一个文件；批量 PDF 逐条 emit note-export-progress */
+  exportNotesOfFolder: (
+    folderId: number,
+    dir: string,
+    format: 'markdown' | 'html' | 'pdf',
+    bodies: { id: number; html: string }[],
+  ) =>
+    invoke<{ exported: number; images: number; failed: string[]; dir: string; cancelled: boolean }>(
+      'export_notes_of_folder',
+      { folderId, dir, format, bodies },
+    ),
+  /** 取消正在进行的整夹导出（幂等） */
+  exportNotesCancel: () => invoke<void>('export_notes_cancel'),
   importNotes: (dir: string, opts?: { overwrite?: boolean }) =>
     invoke<{ imported: number; skipped: number; failed: string[]; cancelled: boolean }>('import_notes', {
       dir,
@@ -1295,6 +1382,9 @@ export const tauriApi = {
   deleteTodo: (id: number) => invoke<void>('delete_todo', { id }),
   scheduleTodo: (id: number, dueAt: number | null, remindAt: number | null) =>
     invoke<Todo>('schedule_todo', { id, dueAt, remindAt }),
+  /** 设置提醒通知方式：不动提醒时刻、不重新武装已触发的提醒 */
+  setTodoNotifyMode: (id: number, mode: string) =>
+    invoke<Todo>('set_todo_notify_mode', { id, mode }),
   /** 待办拖拽排序：按传入顺序写入手动排序位（前端按分组计算完整顺序） */
   reorderTodoOrders: (ids: number[]) => invoke<void>('reorder_todo_orders', { ids }),
   /** 跨父拖拽：子待办改挂到另一个顶级父待办，并重写目标父下子项顺序 */
@@ -1720,6 +1810,41 @@ export const tauriApi = {
   /** 从市场更新扩展（校验 + 版本比较 + 备份 + 保留用户点文件 + 原子替换 + 回滚），返回扩展 id */
   updateFromMarket: (extension: MarketExtension) =>
     invoke<string>('update_extension', { extension }),
+  // ---- 扩展反馈（平台托管、公开可见） ----
+  /** 提交扩展反馈（匿名可；登录时服务端记用户名）。返回反馈 id */
+  submitExtensionFeedback: (payload: {
+    extId: string
+    kind: ExtensionFeedbackKind
+    body: string
+    contact?: string
+    diagnostics?: string
+    appVersion?: string
+    extVersion?: string
+  }) =>
+    invoke<number>('submit_extension_feedback', {
+      extId: payload.extId,
+      kind: payload.kind,
+      body: payload.body,
+      contact: payload.contact ?? null,
+      diagnostics: payload.diagnostics ?? null,
+      appVersion: payload.appVersion ?? null,
+      extVersion: payload.extVersion ?? null,
+    }),
+  /** 某扩展的公开反馈列表（匿名可读；不含联系方式与诊断） */
+  listExtensionFeedback: (extId: string) =>
+    invoke<ExtensionFeedbackPage>('list_extension_feedback', { extId }),
+  /** 我发布的扩展与未读数（未登录返回全 0，不报错） */
+  feedbackInboxUnread: () => invoke<FeedbackUnread>('feedback_inbox_unread'),
+  /** 开发者收件箱完整列表（需登录且为扩展所有者；含联系方式与诊断） */
+  feedbackInboxList: (extId: string) =>
+    invoke<ExtensionFeedback[]>('feedback_inbox_list', { extId }),
+  /** 把这批反馈标记为已读（服务端水位推到当前最大 id） */
+  feedbackMarkRead: (extId: string) => invoke<void>('feedback_mark_read', { extId }),
+  /** 公开回复（可同时标记为已解决） */
+  feedbackReply: (id: number, reply: string, resolved = false) =>
+    invoke<void>('feedback_reply', { id, reply, resolved }),
+  /** 隐藏 / 恢复一条反馈（软删：公开面消失，管理员仍可见） */
+  feedbackHide: (id: number, hidden = true) => invoke<void>('feedback_hide', { id, hidden }),
   // ---- 应用更新 ----
   /** 检查应用更新（拉取 update.json + Ed25519 验签 + 版本比较），失败静默返回无更新。
    * `manual`：About 页手动触发时传 true——忽略「跳过此版本」记录，让用户能再次主动获取该版本。 */
