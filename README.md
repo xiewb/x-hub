@@ -10,7 +10,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-6.x-3178c6?logo=typescript&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-1.77+-dea584?logo=rust&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-local-003b57?logo=sqlite&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.9.2-blue)
+![Version](https://img.shields.io/badge/version-0.9.3-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 </div>
@@ -165,13 +165,7 @@ src-tauri/src/
 
 ## 💬 交流群
 
-使用中遇到问题、有功能建议，或想交流效率工具心得，欢迎加入 **x-hub 交流群**：
-
-<img width="360" height="544" alt="群聊：x-hub交流 ② 群" src="assets/wechat-group-qr.png" />
-
-
-
-> 二维码 7 天内有效，过期后重新进入会更新。若二维码失效，请到 [Issues](https://github.com/dckxx/x-hub/issues) 留言获取最新二维码。
+使用中遇到问题、有功能建议，或想交流效率工具心得，欢迎加入微信群：[点击加入微信群](https://docs.qq.com/doc/DRnBVSGREUm1qUkJZ)
 
 ## 🔄 Fork 合并约定
 
