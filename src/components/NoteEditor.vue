@@ -989,11 +989,32 @@ function captureCrepeMarkdown(): string | null {
   const c = crepe
   if (!c) return null
   try {
-    return c.getMarkdown()
+    return normalizeEditorMarkdown(c.getMarkdown())
   } catch (e) {
     console.warn('读取编辑器 Markdown 失败', e)
     return null
   }
+}
+
+/**
+ * 编辑器源码规范化：消除“源码比预览多出空行”的观感。
+ *
+ * 根因：空段落里被主动塞入零宽占位符 U+200B（保证斜杠菜单可触发，见编辑器
+ * placeholder 逻辑），getMarkdown() 序列化后每个空段落成为「\u200b\n\n」——
+ * 预览里零宽不可见，源码里却是一行可见的伪空行。此外连按多次回车后
+ * 空段落会累积出 3+ 连续换行。
+ *
+ * 处理：①整行仅零宽/不可见字符（含首尾缩进）→ 清成真空行；②3+ 连续换行收敛为 1 个空行；
+ * ③文末换行收敛为单个；④去除文末零宽残渣。语义上空段落（用户故意敲的空行）保留为 1 个空行。
+ */
+function normalizeEditorMarkdown(md: string): string {
+  let out = md
+    .replace(/^[\u200B\u200C\u200D\uFEFF\u00A0\t ]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[\u200B\u200C\u200D\uFEFF\u00A0]+$/g, '')
+  if (out.trim() === '') return ''
+  if (!out.endsWith('\n')) out += '\n'
+  return out
 }
 
 /** 离开当前笔记时立刻落盘。id 用离开前的那篇，不能用已经换上来的 props.note。 */
