@@ -1,17 +1,19 @@
 <script setup lang="ts">
-import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, ref, watch, type Component } from 'vue'
 import { Crepe } from '@milkdown/crepe'
 import '@milkdown/crepe/theme/common/style.css'
 import '@milkdown/crepe/theme/frame.css'
 import { editorViewCtx, parserCtx, serializerCtx } from '@milkdown/kit/core'
+import { callCommand } from '@milkdown/kit/utils'
+import { undoCommand, redoCommand } from '@milkdown/kit/plugin/history'
 import type { Ctx } from '@milkdown/kit/ctx'
 import { imageBlockSchema } from '@milkdown/kit/component/image-block'
-import { codeBlockSchema } from '@milkdown/kit/preset/commonmark'
+import { codeBlockSchema, remarkLineBreak } from '@milkdown/kit/preset/commonmark'
 import { createTable } from '@milkdown/kit/preset/gfm'
 import { Fragment, Slice, type Node as ProseNode, type Schema } from '@milkdown/kit/prose/model'
 import type { EditorView } from '@milkdown/kit/prose/view'
 import { NodeSelection, TextSelection, type EditorState } from '@milkdown/kit/prose/state'
-import { Code2, Columns2, Copy, Eye, Link2, PencilLine, Plus, Smile, Sparkles, Tag as TagIcon, WandSparkles, Waypoints, X } from 'lucide-vue-next'
+import { Bold, Code, Code2, Columns2, Copy, Eye, Heading1, Heading2, Heading3, Highlighter, Italic, Link2, List, ListOrdered, ListTree, ListTodo, Minus, PencilLine, Plus, Quote, Redo2, Smile, Sparkles, SquareCode, Strikethrough, Tag as TagIcon, Undo2, WandSparkles, Waypoints, X } from 'lucide-vue-next'
 import { isPlatformModel, isTauri, tauriApi, PLATFORM_ENTRY_NAME, type Note, type NoteLinks, type Tag } from '../api/tauri'
 import { cleanModelMarkdownNoise } from '../utils/markdownLines'
 import { useStore } from '../stores/workbench'
@@ -21,6 +23,7 @@ import { guessCodeLanguage, looksLikeCode, unwrapFencedCode } from '../utils/pas
 import { beautifyNoteMarkdown } from '../utils/markdownBeautify'
 import { copyPlainText } from '../utils/clipboardPlainText'
 import { restoreNoteImageSyntax } from '../utils/noteImageSyntax'
+import { forkHighlightRemark, highlightMark } from '../utils/forkHighlight'
 import { expandOnEnter, matchWysiwygLine, type LineShortcut } from '../utils/markdownEnter'
 import { loosenHtmlBreaks, renderNoteMarkdown, restoreCrepeMarkdown } from '../utils/markdownHtml'
 import { deriveNoteTitle } from '../utils/markdown'
@@ -175,7 +178,7 @@ async function destroyEditor() {
 
 /** 公共 Crepe 配置：主编辑区与分屏预览共用同一份，保证两个实例渲染完全一致 */
 function buildCrepe(root: HTMLElement, content: string): Crepe {
-  return new Crepe({
+  const c = new Crepe({
     root,
     defaultValue: loosenHtmlBreaks(content),
     // AI 特性需外部模型服务，保持纯本地
@@ -262,6 +265,13 @@ function buildCrepe(root: HTMLElement, content: string): Crepe {
         },
       },
   })
+  // 单换行修复（fork）：让段落内 text 的 \n 解析为 hardbreak（视觉换行），
+  // 序列化仍输出干净的单换行，与实时预览 marked {breaks:true} 的语义一致，
+  // 消除源码↔预览来回切换产生的空行
+  c.editor.use(remarkLineBreak)
+  // ==高亮== 扩展（fork）：remark 双向 transformer + mark schema
+  c.editor.use(forkHighlightRemark).use(highlightMark)
+  return c
 }
 
 async function mountEditor(content: string) {
@@ -705,6 +715,274 @@ function deriveTitleFromContent(markdown: string) {
   if (localTitle.value !== '' && localTitle.value !== '无标题笔记') return
   const derived = deriveNoteTitle(markdown)
   if (derived) localTitle.value = derived
+}
+
+// ---- 格式工具栏（fork 恢复）：三模式通用的 Markdown 文本变换 ----
+type MdAction =
+  | 'bold'
+  | 'italic'
+  | 'strike'
+  | 'code'
+  | 'highlight'
+  | 'link'
+  | 'h1'
+  | 'h2'
+  | 'h3'
+  | 'ul'
+  | 'ol'
+  | 'task'
+  | 'quote'
+  | 'codeblock'
+  | 'hr'
+  | 'undo'
+  | 'redo'
+
+const WRAP_ACTIONS: Partial<Record<MdAction, [string, string, string]>> = {
+  highlight: ['==', '高亮文本', '=='],
+  bold: ['**', '加粗文字', '**'],
+  italic: ['*', '斜体文字', '*'],
+  strike: ['~~', '删除文字', '~~'],
+  code: ['`', '代码', '`'],
+  link: ['[', '链接文字', '](https://)'],
+}
+
+const PREFIX_ACTIONS: Partial<Record<MdAction, string>> = {
+  h1: '# ',
+  h2: '## ',
+  h3: '### ',
+  ul: '- ',
+  task: '- [ ] ',
+  quote: '> ',
+}
+
+/** 对 Markdown 源文本做包裹/行前缀变换，返回新文本与建议选区 */
+function transformMarkdown(
+  src: string,
+  selStart: number,
+  selEnd: number,
+  action: MdAction,
+): { text: string; selStart: number; selEnd: number } {
+  // 包裹类：选中则包裹，已包裹则取消，无选中插入占位
+  const wrap = WRAP_ACTIONS[action]
+  if (wrap) {
+    const [open, placeholder, close] = wrap
+    const hasSel = selEnd > selStart
+    const selected = src.slice(selStart, selEnd)
+    if (
+      hasSel &&
+      src.slice(Math.max(0, selStart - open.length), selStart) === open &&
+      src.slice(selEnd, selEnd + close.length) === close
+    ) {
+      const text =
+        src.slice(0, selStart - open.length) + selected + src.slice(selEnd + close.length)
+      return { text, selStart: selStart - open.length, selEnd: selEnd - open.length }
+    }
+    const body = hasSel ? selected : placeholder
+    const insert = open + body + close
+    const text = src.slice(0, selStart) + insert + src.slice(selEnd)
+    return { text, selStart: selStart + open.length, selEnd: selStart + open.length + body.length }
+  }
+
+  // 分割线：文档末尾追加水平线
+  if (action === 'hr') {
+    const base = src.length > 0 && !src.endsWith('\n') ? src + '\n' : src
+    const text = base + '\n---\n'
+    return { text, selStart: text.length, selEnd: text.length }
+  }
+
+  // 代码块：选中内容用围栏包住
+  if (action === 'codeblock') {
+    const body = src.slice(selStart, selEnd) || '代码块'
+    const insert = '```\n' + body + '\n```'
+    const text = src.slice(0, selStart) + insert + src.slice(selEnd)
+    return { text, selStart: selStart + 4, selEnd: selStart + 4 + body.length }
+  }
+
+  // 行前缀类（标题/列表/引用）：作用于选区覆盖的所有行；再按一次取消
+  if (action === 'ol') {
+    const ls = src.lastIndexOf('\n', selStart - 1) + 1
+    let le = src.indexOf('\n', selEnd)
+    if (le === -1) le = src.length
+    const lines = src.slice(ls, le).split('\n')
+    let at = 0
+    const numbered = lines.map((l) => {
+      if (l.trim() === '' && lines.length > 1) return l
+      at += 1
+      return at + '. ' + l.replace(/^\s*(-|\*|\d+\.)\s+/, '')
+    })
+    const newBlock = numbered.join('\n')
+    const text = src.slice(0, ls) + newBlock + src.slice(le)
+    return { text, selStart: ls, selEnd: ls + newBlock.length }
+  }
+  const prefix = PREFIX_ACTIONS[action]
+  if (prefix) {
+    const ls = src.lastIndexOf('\n', selStart - 1) + 1
+    let le = src.indexOf('\n', selEnd)
+    if (le === -1) le = src.length
+    const lines = src.slice(ls, le).split('\n')
+    const allHave = lines.every((l) => l.startsWith(prefix) || l.trim() === '')
+    const changed = lines.map((l) => {
+      if (l.trim() === '' && lines.length > 1) return l
+      if (allHave) return l.startsWith(prefix) ? l.slice(prefix.length) : l
+      // 去掉已有的其他列表/引用标记，避免叠加
+      return prefix + l.replace(/^\s*(-\s\[[ x]\]\s|[-*]\s|\d+\.\s|>\s)/, '')
+    })
+    const newBlock = changed.join('\n')
+    const text = src.slice(0, ls) + newBlock + src.slice(le)
+    return { text, selStart: ls, selEnd: ls + newBlock.length }
+  }
+  return { text: src, selStart, selEnd }
+}
+
+const TOOLBAR_BUTTONS: { action: MdAction; title: string; icon: Component }[] = [
+  { action: 'bold', title: '加粗', icon: Bold },
+  { action: 'italic', title: '斜体', icon: Italic },
+  { action: 'strike', title: '删除线', icon: Strikethrough },
+  { action: 'h1', title: '一级标题', icon: Heading1 },
+  { action: 'h2', title: '二级标题', icon: Heading2 },
+  { action: 'h3', title: '三级标题', icon: Heading3 },
+  { action: 'ul', title: '无序列表', icon: List },
+  { action: 'ol', title: '有序列表', icon: ListOrdered },
+  { action: 'task', title: '任务列表', icon: ListTodo },
+  { action: 'quote', title: '引用', icon: Quote },
+  { action: 'code', title: '行内代码', icon: Code },
+  { action: 'highlight', title: '高亮', icon: Highlighter },
+  { action: 'codeblock', title: '代码块', icon: SquareCode },
+  { action: 'link', title: '链接', icon: Link2 },
+  { action: 'hr', title: '分割线', icon: Minus },
+  { action: 'undo', title: '撤销 (Ctrl+Z)', icon: Undo2 },
+  { action: 'redo', title: '重做 (Ctrl+Y)', icon: Redo2 },
+]
+
+function activeTextarea(): HTMLTextAreaElement | null {
+  return mode.value === 'split' ? splitSourceEl.value : mode.value === 'source' ? sourceEl.value : null
+}
+
+function applyMdAction(action: MdAction) {
+  if (!props.note) return
+  // 历史操作走命令通道（非文本变换）：wysiwyg 用 Crepe 内置 history，源码/分屏用 textarea 原生 undo
+  if (action === 'undo' || action === 'redo') {
+    if (mode.value === 'wysiwyg') {
+      if (!crepe) return
+      crepe.editor.action(callCommand(action === 'undo' ? undoCommand.key : redoCommand.key))
+      return
+    }
+    const ta = activeTextarea()
+    if (ta) {
+      ta.focus()
+      document.execCommand(action === 'undo' ? 'undo' : 'redo')
+    }
+    return
+  }
+  const ta = activeTextarea()
+  if (ta) {
+    const selStart = ta.selectionStart
+    const selEnd = ta.selectionEnd
+    const { text, selStart: ns, selEnd: ne } = transformMarkdown(ta.value, selStart, selEnd, action)
+    ta.value = text
+    ta.setSelectionRange(ns, ne)
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+    ta.focus()
+    return
+  }
+  // wysiwyg：Crepe 拿不到等价的源码光标位置，退化在文末操作；capture → 变换 → 重挂
+  const md = captureCrepeMarkdown()
+  if (md == null) return
+  const { text } = transformMarkdown(md, md.length, md.length, action)
+  adoptMarkdown(text)
+  void nextTick(() => {
+    if (rootEl.value && mode.value === 'wysiwyg') void mountEditor(localContent.value)
+  })
+}
+
+// ---- 大纲导航（fork 恢复）：wysiwyg 读 ProseMirror 文档，源码/分屏扫行 ----
+interface OutlineItem {
+  level: number
+  text: string
+  pos?: number // wysiwyg: ProseMirror 位置
+  line?: number // source/split: 行号（1 起）
+}
+const outlineVisible = ref(false)
+const outlineItems = ref<OutlineItem[]>([])
+let outlineTimer: ReturnType<typeof setInterval> | null = null
+
+function pmView(): EditorView | null {
+  if (!crepe) return null
+  let v: EditorView | null = null
+  crepe.editor.action((ctx) => {
+    v = ctx.get(editorViewCtx)
+  })
+  return v
+}
+
+function buildWysiwygOutline(items: OutlineItem[]): void {
+  const view = pmView()
+  if (!view) return
+  view.state.doc.descendants((node, pos) => {
+    if (node.type.name === 'heading') {
+      items.push({ level: Number(node.attrs.level) || 1, text: node.textContent, pos })
+    }
+    return
+  })
+}
+
+function buildSourceOutline(items: OutlineItem[]): void {
+  const lines = localContent.value.split('\n')
+  let inFence = false
+  lines.forEach((ln, i) => {
+    if (/^\s*(```|~~~)/.test(ln)) {
+      inFence = !inFence
+      return
+    }
+    if (inFence) return
+    const m = /^(#{1,6})\s+(.*)$/.exec(ln)
+    if (m) items.push({ level: m[1].length, text: m[2].trim(), line: i + 1 })
+  })
+}
+
+/** 重建大纲；内容无变化时不触发响应式更新 */
+function rebuildOutline() {
+  const items: OutlineItem[] = []
+  if (mode.value === 'wysiwyg') buildWysiwygOutline(items)
+  else buildSourceOutline(items)
+  if (JSON.stringify(items) !== JSON.stringify(outlineItems.value)) outlineItems.value = items
+}
+
+function toggleOutline() {
+  outlineVisible.value = !outlineVisible.value
+  if (outlineVisible.value) {
+    rebuildOutline()
+    // 面板打开期间轻量轮询（600ms 字符串对比），捕捉编辑中标题变化
+    if (!outlineTimer) outlineTimer = setInterval(() => {
+      if (outlineVisible.value) rebuildOutline()
+    }, 600)
+  } else stopOutlineTimer()
+}
+
+function stopOutlineTimer() {
+  if (outlineTimer) {
+    clearInterval(outlineTimer)
+    outlineTimer = null
+  }
+}
+
+function onOutlineClick(item: OutlineItem) {
+  if (mode.value === 'wysiwyg') {
+    const view = pmView()
+    if (!view || item.pos == null) return
+    view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, item.pos)).scrollIntoView())
+    view.focus()
+  } else {
+    const ta = activeTextarea()
+    if (!ta || item.line == null) return
+    const lines = ta.value.split('\n')
+    let pos = 0
+    for (let i = 0; i < item.line - 1 && i < lines.length; i += 1) pos += lines[i].length + 1
+    ta.focus()
+    ta.setSelectionRange(pos, pos)
+    const ratio = item.line / Math.max(1, lines.length)
+    ta.scrollTop = ratio * ta.scrollHeight - ta.clientHeight / 2
+  }
 }
 
 function captureCrepeMarkdown(): string | null {
@@ -2528,6 +2806,32 @@ function onEditorAreaMouseDown(e: MouseEvent) {
         </div>
       </header>
 
+      <!-- 格式工具栏（fork 恢复）：三模式通用（Markdown 文本变换） -->
+      <div class="md-toolbar" role="toolbar" aria-label="格式工具栏">
+        <button
+          v-for="b in TOOLBAR_BUTTONS"
+          :key="b.action"
+          type="button"
+          class="md-tool-btn"
+          :title="b.title"
+          :aria-label="b.title"
+          @click="applyMdAction(b.action)"
+        >
+          <component :is="b.icon" :size="14" :stroke-width="2" />
+        </button>
+        <span class="md-tool-sep" aria-hidden="true"></span>
+        <button
+          type="button"
+          class="md-tool-btn"
+          :class="{ active: outlineVisible }"
+          title="大纲"
+          aria-label="大纲"
+          @click="toggleOutline"
+        >
+          <ListTree :size="14" :stroke-width="2" />
+        </button>
+      </div>
+
       <!-- 来源链接（剪藏笔记） -->
       <div v-if="note.source_url" class="ed-source">
         <Link2 :size="12" :stroke-width="1.8" />
@@ -2636,6 +2940,33 @@ function onEditorAreaMouseDown(e: MouseEvent) {
             </template>
           </div>
         </aside>
+
+        <!-- 大纲导航面板（fork 恢复，右上浮层） -->
+        <Transition name="outline-panel">
+          <div v-if="outlineVisible" class="outline-panel">
+            <div class="outline-head">
+              <span>大纲</span>
+              <button type="button" class="outline-close" title="关闭" @click="outlineVisible = false">
+                <X :size="13" :stroke-width="2" />
+              </button>
+            </div>
+            <div v-if="outlineItems.length" class="outline-list">
+              <button
+                v-for="(it, i) in outlineItems"
+                :key="i"
+                type="button"
+                class="outline-item"
+                :style="{ paddingLeft: (it.level - 1) * 12 + 8 + 'px' }"
+                :title="it.text"
+                @click="onOutlineClick(it)"
+              >
+                <span class="outline-lv">H{{ it.level }}</span>
+                <span class="outline-text">{{ it.text || '（空标题）' }}</span>
+              </button>
+            </div>
+            <p v-else class="outline-empty">暂无标题，用「# 标题」或斜杠菜单创建</p>
+          </div>
+        </Transition>
       </div>
 
       <!-- 底栏：左标签行 + 右保存状态 -->
@@ -3962,5 +4293,187 @@ html[data-wallpaper-clear='1'] .md-preview p code,
 html[data-wallpaper-clear='1'] .md-preview li code {
   background: rgba(28, 29, 41, 0.62);
   color: rgba(255, 255, 255, 0.92);
+}
+</style>
+
+<style>
+/* ==== fork 修复恢复区（合并上游 v0.9.x 时被覆盖，自 v0.8.4 版本移植回来） ==== */
+
+/* 单换行视觉统一：remarkLineBreak 把源码内单换行解析为 inline hardbreak，
+ * milkdown 将其 toDOM 为含一个空格的 span（文字连排），与实时预览 <br> 不一致。
+ * 这里把该 span 变为零高度强制断行，与预览 <br> 视觉对齐。
+ * 【必须在非 scoped 块】：ProseMirror 动态创建的 span 无 data-v 属性，
+ *   scoped 规则会附加 [data-v] 到 span 上永远不命中（曾致多行内容连排成一行）。 */
+.crepe-root .milkdown span[data-type='hardbreak'][data-is-inline='true'] {
+  display: block;
+  height: 0;
+  overflow: hidden;
+  font-size: 0;
+  line-height: 0;
+  white-space: pre;
+}
+
+/* ==高亮== 扩展语法的视觉：富文本内 mark 元素（fork 自定义 schema 输出） */
+.crepe-root mark.hl-mark,
+.md-preview mark.hl-mark {
+  padding: 0 3px;
+  background: color-mix(in srgb, var(--c-yellow) 45%, transparent);
+  color: inherit;
+  border-radius: 3px;
+}
+[data-theme='dark'] .crepe-root mark.hl-mark,
+[data-theme='dark'] .md-preview mark.hl-mark {
+  background: color-mix(in srgb, var(--c-yellow) 32%, transparent);
+}
+
+/* 恢复 Markdown 预览列表标记：上游全局 reset（ol,ul{list-style:none}）把
+   预览的编号/圆点吞掉，与实时预览（Crepe 自有编号方案）不一致 */
+.md-preview ol {
+  list-style-type: decimal;
+}
+.md-preview ul {
+  list-style-type: disc;
+}
+.md-preview ul ul {
+  list-style-type: circle;
+}
+.md-preview li {
+  margin: 0;
+}
+
+/* ---- 格式工具栏：三模式通用 ---- */
+.md-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1px;
+  padding: 0 6px 6px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--border-1);
+}
+.md-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  color: var(--text-3);
+  transition: background 0.12s, color 0.12s;
+}
+.md-tool-btn:hover {
+  background: var(--bg-card-soft);
+  color: var(--text-1);
+}
+.md-tool-btn.active {
+  background: var(--brand-50);
+  color: var(--brand-500);
+}
+.md-tool-btn:active {
+  background: var(--brand-50);
+  color: var(--brand-500);
+}
+/* 工具栏功能分组分隔线 */
+.md-tool-sep {
+  width: 1px;
+  height: 14px;
+  margin: 0 4px;
+  background: var(--border-strong);
+  opacity: 0.5;
+}
+
+/* ---- 大纲导航面板（右上浮层） ---- */
+.outline-panel {
+  position: absolute;
+  top: 8px;
+  right: 16px;
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  width: 248px;
+  max-height: 62%;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg, 12px);
+  background: var(--bg-card-solid);
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
+  box-shadow: 0 8px 28px rgba(30, 30, 60, 0.16);
+  overflow: hidden;
+}
+.outline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border-soft);
+}
+.outline-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  color: var(--text-3);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.outline-close:hover {
+  background: var(--c-red);
+  color: #fff;
+}
+.outline-list {
+  overflow-y: auto;
+  padding: 4px;
+}
+.outline-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.outline-item:hover {
+  background: var(--brand-50);
+  color: var(--text-1);
+}
+.outline-lv {
+  flex-shrink: 0;
+  padding: 0 3px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--text-4);
+  background: var(--bg-card-soft);
+  border-radius: 3px;
+}
+.outline-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.outline-empty {
+  padding: 14px 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.outline-panel-enter-active,
+.outline-panel-leave-active {
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+.outline-panel-enter-from,
+.outline-panel-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
 }
 </style>
