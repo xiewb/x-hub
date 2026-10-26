@@ -605,7 +605,9 @@ watch(
 
 function syncLocal() {
   localTitle.value = props.note?.title ?? ''
-  localContent.value = props.note?.content ?? ''
+  // 存量笔记在旧版本里已把「零宽占位符空行」写进正文：装入时清一次，
+  // 否则这些笔记切到源码模式仍会看到伪空行（新写入路径由 onEdited 保证）
+  localContent.value = normalizeEditorMarkdown(props.note?.content ?? '')
   dirty.value = false
 }
 
@@ -629,7 +631,10 @@ function normalizeTitle(title: string): string {
 function onEdited(markdown: string) {
   if (!props.note || mode.value !== 'wysiwyg') return
   // Crepe 序列化会加上 \[ \* 并把列表/分隔线改写成星号。收回来再存，切到分屏才和实时预览一致。
-  adoptMarkdown(restoreCrepeMarkdown(markdown))
+  // 必须同样过 normalizeEditorMarkdown：markdownUpdated 是 wysiwyg 的主保存路径，
+  // 上一版只在 captureCrepeMarkdown（取文落盘）规范化，这里漏掉导致源码模式仍多出
+  // 零宽占位符伪空行（\u200b 整行）。
+  adoptMarkdown(normalizeEditorMarkdown(restoreCrepeMarkdown(markdown)))
   // ratio 等图片属性可能经撤销/属性事务变化，同步一次宽度（幂等、无强制布局）
   syncImageWidths()
 }
