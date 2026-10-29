@@ -3038,6 +3038,7 @@ mod tests {
             config: Map::new(),
             module_variants: vec![],
             module_options: Default::default(),
+            titlebar_options: None,
             agent: None,
         };
         assert!(declares(&manifest, "data:read"));

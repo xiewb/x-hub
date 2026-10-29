@@ -25,10 +25,12 @@ export interface Resource {
 /** 工作台「自定义速达」槽位内容配置（槽位 id 固定 suda1..suda4，同便签 1/2 池子模式） */
 export interface SudaCustomModuleConfig {
   id: string
-  /** 内容来源：pinned(手动挑选,顺序=resource_ids) / app / web / file(整个大类) / subcategory(指定小类) */
-  source: 'pinned' | 'app' | 'web' | 'file' | 'subcategory'
+  /** 内容来源：pinned(手动挑选,顺序=resource_ids) / app / web / file(整个大类) / subcategory(指定小类) / zone(指定分区) */
+  source: 'pinned' | 'app' | 'web' | 'file' | 'subcategory' | 'zone'
   /** source = subcategory 时的小类名（resources.category 口径） */
   subcategory: string
+  /** source = zone 时的分区 id（resources.zone_id 口径；null = 未指定；成员增删实时过滤、自动跟随） */
+  zone_id: number | null
   /** source = pinned 时的资源 id 序（勾选顺序即展示顺序；已删除的资源自动跳过） */
   resource_ids: number[]
 }
@@ -100,6 +102,8 @@ export interface Note {
   icon: string | null
   /** 组内手动排序位（拖拽排序；null = 未手动排序） */
   sort_order: number | null
+  /** 笔记形态：text = 文本笔记；sheet = 表格笔记（content 存 xhub-sheet 协议 URL） */
+  kind: string
 }
 
 export interface Todo {
@@ -516,6 +520,8 @@ export interface ExtensionEntry {
   module_variants: ExtensionModuleVariant[]
   /** 工作台模块选项（manifest.moduleOptions；module 卡片表头默认显隐） */
   module_options: ExtensionModuleOptions
+  /** 标题栏小部件默认显示位（manifest.titlebarOptions.position；null = 未声明/取值非法，按居中，用户显式设置优先） */
+  titlebar_position: string | null
   /** 安装时间（目录创建时间，RFC3339；「已安装」列表按此排序，最后安装的在最下面） */
   installed_at: string | null
   /** 声明给 AI 助手的工具（manifest.agent.tools 校验后的合格子集，空 = 未声明） */
@@ -1340,6 +1346,9 @@ export const tauriApi = {
       folderId: folderId ?? null,
       sourceUrl,
     }),
+  /** 新建表格笔记（速记「表格」形态）：url 为 importNoteSheet 返回的 xhub-sheet 协议 URL */
+  createSheetNote: (title: string, url: string, folderId: number | null) =>
+    invoke<Note>('create_sheet_note', { title, url, folderId: folderId ?? null }),
   updateNote: (id: number, title: string, content: string) =>
     invoke<Note>('update_note', { id, title, content }),
   getNote: (noteId: number) => invoke<Note | null>('get_note', { noteId }),
@@ -1507,6 +1516,12 @@ export const tauriApi = {
   /** 保存笔记图片（base64，不含 data: 前缀）：落盘 notes/images，返回 xhub-note 协议 URL */
   importNoteImage: (dataB64: string, ext: string) =>
     invoke<string>('import_note_image', { dataB64, ext }),
+  /** 保存笔记表格文档（速记内嵌 Excel）：落盘 notes/files，返回展示名 + xhub-sheet 协议 URL */
+  importNoteSheet: (dataB64: string, name: string) =>
+    invoke<{ name: string; url: string }>('import_note_sheet', { dataB64, name }),
+  /** 表格文档编辑结果写回（协议 URL 末段文件名，就地覆盖） */
+  saveNoteSheet: (name: string, dataB64: string) =>
+    invoke<void>('save_note_sheet', { name, dataB64 }),
   /** 复制笔记内嵌图片到系统剪贴板（xhub-note URL，后端按协议同款口径校验文件名） */
   copyNoteImage: (url: string) => invoke<void>('copy_note_image', { url }),
   inspectPath: (path: string) =>
