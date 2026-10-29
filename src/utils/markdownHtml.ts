@@ -1,6 +1,6 @@
 import DOMPurify from 'dompurify'
 import { marked, Renderer } from 'marked'
-import { mapInlineProse, mapMarkdownLines } from './markdownLines'
+import { expandBlankLines, mapInlineProse, mapMarkdownLines } from './markdownLines'
 
 /**
  * 轻量 Markdown → 安全 HTML（待办描述等**只读展示**用）。
@@ -122,12 +122,16 @@ function escapeProseHtml(text: string): string {
  * - 与 Crepe 序列化对齐由 restoreCrepeMarkdown/loosenHtmlBreaks 承担。 */
 export function renderNoteMarkdown(text: string): string {
   if (!text) return ''
-  const html = marked.parse(escapeProseHtml(loosenHtmlBreaks(text)), {
-    async: false,
-    gfm: true,
-    breaks: true,
-    renderer: noteRenderer,
-  }) as string
+  // 空行数量保真：marked 同样会把连续空行折叠成一次段落分隔，先把 m 个空行
+  // 展开成 (m−1) 个 NBSP 空段落（渲染成可见空行），与编辑器所见一致
+  const html = marked.parse(
+    escapeProseHtml(expandBlankLines(loosenHtmlBreaks(text), '\u00A0')),
+    {
+      async: false,
+      gfm: true,
+      breaks: true,
+      renderer: noteRenderer,
+    }) as string
   return sanitizeNoteHtml(html)
 }
 

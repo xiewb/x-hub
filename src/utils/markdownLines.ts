@@ -78,3 +78,79 @@ export function cleanModelMarkdownNoise(text: string): string {
     )
   })
 }
+
+// ─── 空行数量保真（源码 ⇄ 预览所见即所得）───────────────────────────────────
+//
+// Markdown 规范会把连续空行折叠成一次段落分隔：源码里敲 3 个空行，Crepe/marked
+// 渲染出来只有 1 个段落间距，「所见非所得」。约定如下（两端共用，保证保存往返不漂移）：
+//
+//   源码里 m 个连续空行（m≥2）  ⇔  段落分隔 + (m−1) 个空段落
+//   编辑器侧空段落填零宽 \u200B（与编辑器 placeholder 逻辑同款，斜杠菜单可触发）；
+//   HTML 渲染侧空段落填 NBSP（\u00A0，marked 渲染成可见的空行）。
+//
+// 展开（装载侧）与回收（保存侧）互为逆操作：
+//   expandBlankLines('A\n\n\nB')            === 'A\n\n\u200B\n\nB'
+//   cleanupEditorPlaceholderLines(上者)      === 'A\n\n\nB'
+
+/**
+ * 装载侧：把 ≥2 连续空行的段插入 (m−1) 个 `fill` 空段落行。
+ * 每个空段落行都必须被空行包围（`fill\n\n`），否则单换行会被解析成
+ * 软换行（breaks: true 下是 <br>），空行就并进上一段了。
+ * 围栏与 `$$` 公式里的空行是代码/公式正文，原样跳过。
+ */
+export function expandBlankLines(text: string, fill = '\u200B'): string {
+  if (!text) return text
+  // 快速路径：没有出现 3+ 连续换行（含行间空白）就没有待展开的空行段
+  if (!/\n[ \t]*\n[ \t]*\n/.test(text)) return text
+  // 文末换行是终止符不是空行：先剥掉再统计，处理完补回，否则每轮往返多出 1 个空行
+  const hadEol = text.endsWith('\n')
+  const rows: Array<{ line: string; kind: LineKind }> = []
+  mapMarkdownLines(hadEol ? text.slice(0, -1) : text, (line, kind) => {
+    rows.push({ line, kind })
+    return line
+  })
+  const out: string[] = []
+  let blanks = 0
+  const flush = () => {
+    if (!blanks) return
+    out.push('')
+    for (let i = 1; i < blanks; i++) out.push(fill, '')
+    blanks = 0
+  }
+  for (const { line, kind } of rows) {
+    if (kind === 'prose' && line.trim() === '') {
+      blanks++
+      continue
+    }
+    flush()
+    out.push(line)
+  }
+  flush()
+  const result = out.join('\n')
+  return hadEol ? `${result}\n` : result
+}
+
+/**
+ * 保存侧：回收空段落占位行，还原成对应数量的空行。
+ * ①占位行后紧跟空行 → 连同自身换行并入该空行：序列化「段\n\n\u200b\n\n段」
+ *   回收为「段\n\n\n段」，空行数恰好 = 空段落数（与 expandBlankLines 互逆）；
+ * ②其余位置（文末等）→ 清成真空行（维持旧版行为）。
+ */
+export function cleanupEditorPlaceholderLines(md: string): string {
+  return md
+    .replace(/^[\u200B\u200C\u200D\uFEFF\u00A0\t ]+\n(?=\n)/gm, '')
+    .replace(/^[\u200B\u200C\u200D\uFEFF\u00A0\t ]+$/gm, '')
+    // 文末残留的零宽/不可见占位（非整行）
+    .replace(/[\u200B\u200C\u200D\uFEFF\u00A0]+$/g, '')
+}
+
+/** 列表末尾连按回车产生的空列表项：序列化成「1\.」（转义点号）或「-」之类的
+ *  纯标记行，预览里渲染成只有序号/圆点的空项，源码里是乱码感的伪行 → 整行清掉。
+ *  只作用于普通行，围栏/公式里的 `1\.`、`-` 是代码正文，不删。 */
+const EMPTY_LIST_MARKER = /^\s*(?:\d{1,9}\\?\.\s*|\d{1,9}[）)]\s*|[-*+]\s+|>\s*)$/
+
+export function dropEmptyListMarkerLines(md: string): string {
+  return mapMarkdownLines(md, (line, kind) =>
+    kind === 'prose' && EMPTY_LIST_MARKER.test(line) ? '' : line,
+  )
+}

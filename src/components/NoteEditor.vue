@@ -15,7 +15,12 @@ import type { EditorView } from '@milkdown/kit/prose/view'
 import { NodeSelection, TextSelection, type EditorState } from '@milkdown/kit/prose/state'
 import { Bold, Code, Code2, Columns2, Copy, Eye, Heading1, Heading2, Heading3, Highlighter, Italic, Link2, List, ListOrdered, ListTree, ListTodo, Minus, PencilLine, Plus, Quote, Redo2, Smile, Sparkles, SquareCode, Strikethrough, Tag as TagIcon, Undo2, WandSparkles, Waypoints, X } from 'lucide-vue-next'
 import { isPlatformModel, isTauri, tauriApi, PLATFORM_ENTRY_NAME, type Note, type NoteLinks, type Tag } from '../api/tauri'
-import { cleanModelMarkdownNoise } from '../utils/markdownLines'
+import {
+  cleanModelMarkdownNoise,
+  cleanupEditorPlaceholderLines,
+  dropEmptyListMarkerLines,
+  expandBlankLines,
+} from '../utils/markdownLines'
 import { useStore } from '../stores/workbench'
 import { normalizeShortcutDisplay } from '../composables/useShortcutRecorder'
 import { attachBlockDrag } from '../utils/blockDrag'
@@ -180,7 +185,9 @@ async function destroyEditor() {
 function buildCrepe(root: HTMLElement, content: string): Crepe {
   const c = new Crepe({
     root,
-    defaultValue: loosenHtmlBreaks(content),
+    // 空行数量保真：装载侧先把 m 个连续空行展开成 (m−1) 个零宽空段落，
+    // Crepe 解析后预览/编辑区就能看到与源码等量的空行
+    defaultValue: expandBlankLines(loosenHtmlBreaks(content)),
     // AI 特性需外部模型服务，保持纯本地
     features: { [Crepe.Feature.AI]: false },
     featureConfigs: {
@@ -434,7 +441,7 @@ async function mountSplitPreview(content: string) {
     }
     previewCrepe = c
     previewMountedOn = root
-    previewApplied = loosenHtmlBreaks(content)
+    previewApplied = expandBlankLines(loosenHtmlBreaks(content))
     c.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx)
       view.setProps({
@@ -587,7 +594,7 @@ watch(localContent, () => {
   splitPreviewTimer = setTimeout(() => {
     splitPreviewTimer = null
     if (mode.value !== 'split' || !previewCrepe) return
-    replacePreviewDoc(loosenHtmlBreaks(localContent.value))
+    replacePreviewDoc(expandBlankLines(loosenHtmlBreaks(localContent.value)))
   }, 300)
 })
 
@@ -1013,9 +1020,12 @@ function captureCrepeMarkdown(): string | null {
  * ③文末换行收敛为单个；④去除文末零宽残渣。语义上空段落（用户故意敲的空行）保留为 1 个空行。
  */
 function normalizeEditorMarkdown(md: string): string {
-  let out = md
-    .replace(/^[\u200B\u200C\u200D\uFEFF\u00A0\t ]+$/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
+  // 空段落占位行（\u200b 等）回收成空行——空行数 = 空段落数（与 expandBlankLines 互逆）
+  let out = cleanupEditorPlaceholderLines(md)
+  // 列表末尾连按回车产生的空列表项伪行（「1\.」「-」等纯标记行），只清普通行
+  out = dropEmptyListMarkerLines(out)
+  // 注意：不要在这里收敛 \n{3,}。空行是用户内容（所见即所得），数量由
+  // buildCrepe 侧的 expandBlankLines 反向展开成空段落；旧版的收敛会吃掉用户空行
     .replace(/[\u200B\u200C\u200D\uFEFF\u00A0]+$/g, '')
   if (out.trim() === '') return ''
   if (!out.endsWith('\n')) out += '\n'
