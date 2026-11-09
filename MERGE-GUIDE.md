@@ -71,6 +71,9 @@ cd /e/github-self/x-hub && git pull origin master
 - **git 对齐误导**：冲突块两侧的"公共上下文"可能被 git 错误对齐（两个相似函数体被拼成一个），必要时对照 `git show v0.8.0:<file>` 原版手工重排。
 - **`&&` 链中断**：链条中前一条失败（如脚本 ValueError）会导致后面的 sed/命令**静默不执行**，事后必须用独立命令核验每步实际生效。
 - **凭据弹窗**：`git push` 会触发 TortoiseGit 凭据选择器（`git-credential-helper-sel` 进程），终端长时间无输出≠卡死；屏幕确认弹窗后即恢复。
+- **github.com 443 间歇阻断**（2026-11-09）：https 直连可能直接 `Failed to connect ... port 443`；用 SSH over 443 绕过：`git remote set-url --push origin ssh://git@ssh.github.com:443/xiewb/x-hub.git`，密钥 `/c/Users/Administrator/.ssh/id_ed25519_github`（账户 xiewb 已验证）。
+- **portable npm 损坏**：WPS 灵犀自带的 portable-node npm 缺 `make-fetch-happen/cache/policy.js`，install 全部报 MODULE_NOT_FOUND；改用 `D:/nodejs`（node 24.14 + npm 11.9），`export PATH="/d/nodejs:$PATH"`。
+- **tauri build 与 junction 不兼容**（2026-11-09 五层重组后发现）：tauri-build 用 `\\?\` 前缀读 `src-tauri/target` 内自动生成的 permissions，而 `\\?\` 无法穿透 junction → **`src-tauri/target` 必须是真实目录**，由 `build/out/tauri-target` 反向 junction 指入；另外 PS 构建脚本 `$ErrorActionPreference='Stop'` 会把 vite/tauri 的 stderr 警告当终止错误，wrapper 应用 `'Continue'`。
 - **dev 常驻进程**：`npm run tauri:dev` 不会自行退出，管道 `| tail` 会缓冲全部输出；判断启动成功应查 `app.exe`（`src-tauri/target/debug/app.exe`）进程与 1420 端口，而非等命令结束。
 
 ## 4. 文档同步要求
