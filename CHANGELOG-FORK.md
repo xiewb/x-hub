@@ -45,6 +45,7 @@
 | 11 | 2026-10-05 | `4a8b00c` | v0.7.6 | `6725bd6` | 修复速记编辑器主题全失效（无滚动/错乱/不可编辑）：Tauri 向 CSP 注入 nonce 致 unsafe-inline 失效，运行时动态 style（CodeMirror 主题）全部被拒；security 段加 dangerousDisableAssetCspModification=true 恢复 |
 | 12 | 2026-10-05 | `6725bd6` | v0.7.6 | 待提交 | 修复分屏预览列表编号消失（与实时预览不一致）：上游全局 reset 把 ol/ul 的 list-style 置 none，md-preview 补回 decimal/disc/circle 标记 |
 | 13 | 2026-10-06 | `6725bd6` | v0.7.6 | 待提交 | 修复两预览换行语义不一致：`<br />` 在分屏预览显示字面文本而实时预览为空（escapeProseHtml 转义前提过时）；源码多行在实时预览挤成一行（hardbreak 断行 CSS 落入 Vue scoped data-v 陷阱）；分屏预览单换行不换行（renderNoteMarkdown 无 breaks）。修复：br 转义豁免 + breaks:true + 断行 CSS 移非 scoped 块 |
+| 21 | 2026-11-09 | `4b3ba34`→`68a9c7d` | v0.9.10 | `eee8ae8` | 合并上游 v0.9.10（v0.9.6→v0.9.10，19 提交）：云同步客户端一期（E2EE 口令派生/扫码配对/笔记待办多端同步/推送分批修 413）、待办「一键完成逾期」与导出、速记粘贴多行保留排版与整夹导出合并、chat 停止按钮与会话侧栏修复、工作台布局预设。冲突 4 文件。验证：vite build ✓、cargo check ✓、note 单测 57/57 ✓、app 启动数据加载 ✓ |
 | 20 | 2026-10-19 | `501ad56`→`4b3ba34` | v0.9.0 | 待提交 | 合并上游 v0.9.0（7 提交）：Agent 底座（31 内置工具/权限三档/turn 循环）、扩展工具 manifest 自描述 + extension_tool_list/call 聚合转发、AI 助手独立设置大类、TODO 范围档计数药丸与日历溢出折叠、反谎报铁律。零冲突；53 文件 +7978/-538 |
 | 19 | 2026-10-15 | `4e511e8`→`501ad56` | v0.8.4 | 待提交 | 合并上游 v0.8.4（1 提交）：扩展中心三件套（分类/官方标识/安装次数）+ 列表改版（ec-mcard 卡片网格、可升级标签页、市场排序、自适应分页）、安装上报 install_mid + report_market_install、extensionMeta.ts 七类统一口径与单测、暗色灰阶提亮。零冲突；24 文件 +1072/-166 |
 | 18 | 2026-10-13 | `4808708`→`4e511e8` | v0.8.3 | 待提交 | 合并上游 v0.8.3（3 提交）：工作台日记模块、分屏预览改只读 Crepe 与整图位图复制、剪贴板纯文本提取（fragmentToPlainText）。冲突 3 文件：tauri.conf.json 保留 fork 全禁 CSP 改写（修订 #11 依据），NoteEditor 上游 buildCrepe/mountEditor 拆分结构 + fork CodeMirrorSource 三模式并集，Suda 双方新按钮并存 |
@@ -54,6 +55,17 @@
 | 14 | 2026-10-07 | `33bbcd2`→`6e302db` | v0.8.0 | 已提交 `7241450` | 合并上游 4 提交（速记大改造：文件夹树/回收站体系/双链/图片 GC/AI 美化/导入导出，日历待办横排 #30，速记树拖拽落点与 AI 整理丢图修复，CI 升 Node 24）；58 文件 +8079/-756。冲突 8 文件 23 块手工合并：回收站双实现归一（上游为主+fork 兼容层 soft_delete/list_trash/empty_trash），NoteEditor 双特性并集（fork 工具栏/查找替换/大纲/CodeMirror 源码模式 + 上游 AI 美化/双链面板/图片语法修复，textarea 触点适配 CM 实例 API），NoteList.vue 随上游删除（SpeednoteView 取代，fork 版留存于历史） |
 
 ---
+
+### #21（2026-11-09）合并上游 v0.9.10：云同步一期与待办/速记增强
+
+- **时间/基点**：2026-11-09，`4b3ba34`→`68a9c7d`（v0.9.6→v0.9.10，19 提交，166 文件 +16873/−12234）。
+- **上游主题**：云同步客户端一期（E2EE 口令派生、扫码配对、笔记/待办多端同步、推送分批修 413、凭据与 KDF 盐对齐）；待办「一键完成逾期」/导出；速记粘贴多行保排版、整夹导出合并、AI 写入即时可见；chat 停止按钮/会话侧栏；工作台布局预设。
+- **冲突（4 文件）**：
+  - `src-tauri/tauri.conf.json`：保留 fork `dangerousDisableAssetCspModification: true`（修订 #11 依据；上游 `["style-src"]` 是其子集）。
+  - `src/components/NoteEditor.vue`：并集——fork `remarkLineBreak` + `forkHighlightRemark`/`highlightMark` 与上游 `listItemBlockConfig` 有序任务序号 renderLabel 共存于 `buildCrepe`，变量名统一 `crepe`。
+  - `Cargo.lock` / `package-lock.json`：取上游版，经 `npm install` / `cargo check` 重新生成校验。
+- **验证**：`npm run build` ✓（vite 18s，vue-tsc 0 error）；`cargo check` ✓；`cargo test note` **57/57** ✓；debug `app.exe` 启动 + 数据加载 ✓（resources=49/notes=10/todos=18）。
+- **备注**：本轮开发目录已按五层规范重组为 `D:\source\x-hub\`（git 根在 `source/`），合并/构建均在新结构下完成；dev 工具链需 `D:/nodejs`（系统 portable npm 的 make-fetch-happen 损坏）。
 
 ### #19（2026-10-15）合并上游 v0.8.4：扩展中心三件套与列表改版
 
