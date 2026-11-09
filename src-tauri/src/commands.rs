@@ -559,6 +559,18 @@ pub fn set_suda_web_open_mode(mode: String) -> Result<String, String> {
     Ok(config.suda_web_open_mode)
 }
 
+/// 云同步「自动同步」开关（默认关闭）：关 = 只在点「立即同步」时同步；
+/// 开 = outbox 非空 / 定时对账 / 聚焦返回自动跑一轮（sync_auto 内部 20s 节流）。
+/// 读写走配置锁 + 专用命令（勿走前端 saveConfig 整份落盘，双写已去）。
+#[tauri::command]
+pub fn set_sync_auto_enabled(enabled: bool) -> Result<bool, String> {
+    let _guard = crate::config::lock();
+    let mut config = crate::config::load();
+    config.sync_auto_enabled = enabled;
+    crate::config::save(&config)?;
+    Ok(config.sync_auto_enabled)
+}
+
 // ---------- 笔记 ----------
 
 #[tauri::command]
@@ -1154,7 +1166,8 @@ pub fn reorder_todo_orders(
     Ok(())
 }
 
-/// 跨父拖拽：把子待办改挂到另一个顶级父待办下，并按传入顺序重写目标父下的子项排序。
+/// 跨父拖拽：改挂父级并按传入顺序重写目标父下的子项排序。
+/// 两个方向：子待办挂到另一顶级父下；无子待办的一级拖到另一级下变为其子待办。
 /// `ordered_ids` 为目标落点后的完整子项顺序（含被移动项）。
 #[tauri::command]
 pub fn move_todo_child(
@@ -1169,11 +1182,26 @@ pub fn move_todo_child(
     drop(conn);
     let _ = app.emit("todos-changed", ());
     log::info!(
-        "子待办改挂父级: id={} -> parent={} (目标下 {} 条)",
+        "待办改挂父级: id={} -> parent={} (目标下 {} 条)",
         id,
         new_parent_id,
         ordered_ids.len()
     );
+    Ok(t)
+}
+
+/// 子待办升回顶级（拖到列表空白处）：parent_id 与 sort_order 一并清空
+#[tauri::command]
+pub fn detach_todo_child(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    id: i64,
+) -> Result<Todo, String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    let t = todo::detach_child(&conn, id)?;
+    drop(conn);
+    let _ = app.emit("todos-changed", ());
+    log::info!("子待办升回顶级: id={}", id);
     Ok(t)
 }
 
@@ -2103,6 +2131,8 @@ enum ConfiguredShortcut {
     Search,
     Chat,
     Notes,
+    Shot,
+    Recorder,
 }
 
 impl ConfiguredShortcut {
@@ -2113,6 +2143,8 @@ impl ConfiguredShortcut {
             ConfiguredShortcut::Search => &mut cfg.search_shortcut,
             ConfiguredShortcut::Chat => &mut cfg.chat_shortcut,
             ConfiguredShortcut::Notes => &mut cfg.notes_shortcut,
+            ConfiguredShortcut::Shot => &mut cfg.shot_shortcut,
+            ConfiguredShortcut::Recorder => &mut cfg.recorder_shortcut,
         }
     }
 
@@ -2123,6 +2155,8 @@ impl ConfiguredShortcut {
             ConfiguredShortcut::Search => "搜索",
             ConfiguredShortcut::Chat => "AI 对话",
             ConfiguredShortcut::Notes => "速记",
+            ConfiguredShortcut::Shot => "截图",
+            ConfiguredShortcut::Recorder => "GIF 录制",
         }
     }
 
@@ -2134,6 +2168,8 @@ impl ConfiguredShortcut {
             ConfiguredShortcut::Search => cfg.search_shortcut_enabled,
             ConfiguredShortcut::Chat => cfg.chat_shortcut_enabled,
             ConfiguredShortcut::Notes => cfg.notes_shortcut_enabled,
+            ConfiguredShortcut::Shot => cfg.shot_shortcut_enabled,
+            ConfiguredShortcut::Recorder => cfg.recorder_shortcut_enabled,
         }
     }
 
@@ -2144,6 +2180,8 @@ impl ConfiguredShortcut {
             ConfiguredShortcut::Search => cfg.search_shortcut_enabled = value,
             ConfiguredShortcut::Chat => cfg.chat_shortcut_enabled = value,
             ConfiguredShortcut::Notes => cfg.notes_shortcut_enabled = value,
+            ConfiguredShortcut::Shot => cfg.shot_shortcut_enabled = value,
+            ConfiguredShortcut::Recorder => cfg.recorder_shortcut_enabled = value,
         }
     }
 
@@ -2169,6 +2207,12 @@ impl ConfiguredShortcut {
             (ConfiguredShortcut::Search, cfg.search_shortcut.clone(), "搜索"),
             (ConfiguredShortcut::Chat, cfg.chat_shortcut.clone(), "AI 对话"),
             (ConfiguredShortcut::Notes, cfg.notes_shortcut.clone(), "速记"),
+            (ConfiguredShortcut::Shot, cfg.shot_shortcut.clone(), "截图"),
+            (
+                ConfiguredShortcut::Recorder,
+                cfg.recorder_shortcut.clone(),
+                "GIF 录制",
+            ),
         ];
         others
             .into_iter()
@@ -2234,6 +2278,8 @@ fn config_field(cfg: &crate::config::AppConfig, which: &ConfiguredShortcut) -> S
         ConfiguredShortcut::Search => cfg.search_shortcut.clone(),
         ConfiguredShortcut::Chat => cfg.chat_shortcut.clone(),
         ConfiguredShortcut::Notes => cfg.notes_shortcut.clone(),
+        ConfiguredShortcut::Shot => cfg.shot_shortcut.clone(),
+        ConfiguredShortcut::Recorder => cfg.recorder_shortcut.clone(),
     }
 }
 
@@ -2255,6 +2301,18 @@ pub fn set_chat_shortcut(app: tauri::AppHandle, value: String) -> Result<String,
     set_configured_shortcut(app, value, ConfiguredShortcut::Chat)
 }
 
+/// 更新截图呼出快捷键（唤起选区层，框选松手直接出图）
+#[tauri::command]
+pub fn set_shot_shortcut(app: tauri::AppHandle, value: String) -> Result<String, String> {
+    set_configured_shortcut(app, value, ConfiguredShortcut::Shot)
+}
+
+/// 更新 GIF 录制呼出快捷键（唤起选区层，框选后设参数再录）
+#[tauri::command]
+pub fn set_recorder_shortcut(app: tauri::AppHandle, value: String) -> Result<String, String> {
+    set_configured_shortcut(app, value, ConfiguredShortcut::Recorder)
+}
+
 /// 启用/禁用某个可自定义全局快捷键：禁用 = 注销该热键但保留键值；启用 = 按当前键值重新注册。
 /// 与 set_*_shortcut 分开：这里只切开关，不动键值本身。
 #[tauri::command]
@@ -2269,6 +2327,8 @@ pub fn set_shortcut_enabled(
         "search" => ConfiguredShortcut::Search,
         "chat" => ConfiguredShortcut::Chat,
         "notes" => ConfiguredShortcut::Notes,
+        "shot" => ConfiguredShortcut::Shot,
+        "recorder" => ConfiguredShortcut::Recorder,
         _ => return Err("未知的快捷键类型".into()),
     };
     let _guard = crate::config::lock();
@@ -2493,6 +2553,31 @@ pub fn inspect_path(path: String) -> Result<PathInfo, String> {
 pub struct PathInfo {
     pub name: String,
     pub is_dir: bool,
+}
+
+// ---------- 待办导出 ----------
+
+/// 待办视图「一键导出」：保存对话框走 Rust 侧（自定义命令不经过插件能力 ACL，
+/// dev 的 localhost 页面与生产页行为一致；前端曾用 plugin-dialog 的 save() 在 dev
+/// 环境被 ACL 拒绝、静默无反馈，表现为「点了没反应」）。返回 None = 用户取消。
+#[tauri::command]
+pub async fn pick_save_path(
+    app: tauri::AppHandle,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    let picked = tauri_plugin_dialog::DialogExt::dialog(&app)
+        .file()
+        .set_file_name(default_name)
+        .add_filter("Markdown", &["md"])
+        .blocking_save_file();
+    Ok(picked.map(|p| p.to_string()))
+}
+
+/// 待办视图「一键导出」：Markdown 内容由前端按当前筛选（范围/标签/完成态）组装好，
+/// 这里只负责把文本写到用户经保存对话框选定的路径（与 note_io「前端传 bodies」同分工）。
+#[tauri::command]
+pub fn export_todos(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {}", e))
 }
 
 // ---------- 数据备份 / 恢复 ----------
@@ -5440,6 +5525,16 @@ pub fn set_chat_panel_side(side: String) -> Result<(), String> {
     let _guard = crate::config::lock();
     let mut config = config::load();
     config.chat_panel_side = side;
+    config::save(&config)
+}
+
+/// 全局记住 AI 对话模型选择（无会话态/新建会话使用；主窗与独立窗共用，锁内读改写
+/// 避免整份 saveConfig 从过期快照覆盖其它字段）
+#[tauri::command]
+pub fn set_chat_selected_model(name: String) -> Result<(), String> {
+    let _guard = crate::config::lock();
+    let mut config = config::load();
+    config.chat_selected_model = name;
     config::save(&config)
 }
 

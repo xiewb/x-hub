@@ -31,6 +31,7 @@ mod precheck;
 mod process;
 mod proxy;
 mod publisher;
+mod recorder;
 mod repo;
 mod runtime;
 mod secret;
@@ -38,6 +39,7 @@ mod service;
 mod shortcut;
 pub mod signing;
 mod skills;
+pub mod sync;
 mod suda_browser;
 mod sticky_window;
 mod sysmon;
@@ -45,6 +47,7 @@ mod todo_reminder;
 mod todo_recurrence;
 mod tray;
 pub mod updater;
+mod webview_focus;
 mod webview_mem;
 mod win_taskbar;
 mod xhub_api;
@@ -61,6 +64,11 @@ mod xhub_api;
 /// - --js-flags=--scavenger_max_new_space_capacity_mb=8：压 V8 新生代堆上限，
 ///   降低 JS 引擎常驻内存；若主窗/编辑器出现 GC 卡顿可放宽到 16–32
 /// - --disk-cache-size=33554432：磁盘缓存上限 32MB
+/// ⚠️ 勿再追加 --enable-low-end-device-mode（v0.9.9 曾加、2026-11-07 摘除）：
+///   低端模式合成立即可见面板上出现网格状伪影；且该参数属环境级，两处参数
+///   （本常量 ↔ tauri.conf.json 主窗）不一致会导致后续 webview 创建全部失败
+///   （WebView2 0x8007139F），守卫测试 webview_mem::tests::
+///   additional_browser_args_match_tauri_conf 锁两处逐字一致。
 pub const ADDITIONAL_BROWSER_ARGS: &str =
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --js-flags=--scavenger_max_new_space_capacity_mb=8 --disk-cache-size=33554432";
 
@@ -71,6 +79,38 @@ use tauri::{Listener, Manager};
 /// 全局 AppHandle：setup 时登记，供拿不到 handle 的上下文广播事件用
 /// （如 chat.rs 的平台 400 自愈路径触发 `chat-models-changed`）。
 pub static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// 屏蔽 WebView2 的浏览器相关功能（右键默认菜单、浏览器加速键 Ctrl+R/F5/F12 等、
+/// DevTools），只保留应用自身的交互。这些属于 WebView2 Settings 层的能力，前端 JS
+/// 拦不到（事件不进页面）。**只接截图/录屏的两个窗口**（recorder.rs）：全屏透明选区层
+/// 上 F5 刷新页面 / 右键菜单是纯干扰；主窗与既有浮窗刻意不接，保留 DevTools 开发能力。
+#[cfg(target_os = "windows")]
+pub fn lockdown_webview(win: &tauri::WebviewWindow) {
+    use tauri::webview::PlatformWebview;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+    use windows_core::Interface;
+
+    let _ = win.with_webview(|platform: PlatformWebview| {
+        unsafe {
+            let controller = platform.controller();
+            if let Ok(core) = controller.CoreWebView2() {
+                if let Ok(settings) = core.Settings() {
+                    // 关闭默认右键菜单（页面自身的 @contextmenu 自定义菜单不受影响）
+                    let _ = settings.SetAreDefaultContextMenusEnabled(false);
+                    // 关闭 F12 等 DevTools
+                    let _ = settings.SetAreDevToolsEnabled(false);
+                    // 关闭浏览器加速键（Ctrl+R / Ctrl+Shift+R / F5 / Ctrl+Shift+I / Ctrl+P 等）
+                    if let Ok(s3) = settings.cast::<ICoreWebView2Settings3>() {
+                        let _ = s3.SetAreBrowserAcceleratorKeysEnabled(false);
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn lockdown_webview(_win: &tauri::WebviewWindow) {}
 
 /// 初始化数据库并返回连接
 fn init_database() -> Result<Connection, Box<dyn std::error::Error>> {
@@ -669,8 +709,8 @@ pub fn run() {
             // 是**全局单例**，而扩展 iframe 与资产资源同源 ⇒ 放行数据根等于任何扩展都能直接
             // fetch 到用户数据库（xhub.db）、app.json 与日志，从而绕开桥 API 的权限系统。
             // 数据目录可被改到 %APPDATA% 之外（自定义目录 / U 盘便携），故必须动态放行。
-            const ASSET_SCOPE_SUBDIRS: [&str; 3] =
-                ["icons", "wallpapers", "clipboard/images"];
+            const ASSET_SCOPE_SUBDIRS: [&str; 4] =
+                ["icons", "wallpapers", "clipboard/images", "captures/pins"];
             for rel in ASSET_SCOPE_SUBDIRS {
                 let dir = crate::paths::data_root().join(rel);
                 // 目录必须先存在：allow_directory 会额外注册 canonicalize 后的模式变体，
@@ -698,6 +738,11 @@ pub fn run() {
     // Agent 运行时状态（#t44）：审批挂起表 / 会话级授权 / 中断旗标
     app.manage(std::sync::Arc::new(agent::state::AgentState::new()));
             app.manage(clipboard::ClipboardState::default());
+            // 截图 / GIF 录制会话状态：open_overlay/recorder_start 等命令经
+            // app.state::<RecorderState>() 取用，漏 manage 会在按下快捷键时 panic 闪退
+            app.manage(recorder::RecorderState::default());
+            // 贴图（盯住）slot 状态：每张钉屏贴图占一个窗口 + 一个落盘路径
+            app.manage(recorder::PinState::default());
             app.manage(service::ServiceState::default());
             // 开发扩展目录映射（「我的扩展」登记；扩展协议与扫描按它解析源码目录）
             app.manage(ext_protocol::DevExtensionDirs::default());
@@ -732,6 +777,44 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 account::verify_session_on_startup(&account_handle).await;
             });
+
+            // 云同步自动推送与定时对账（协议 §6.4 档 0）：
+            // - 本地改动：outbox 触发器已经标脏，但没有任何东西会去推。这里每 10s 看一眼
+            //   outbox（纯本地 SQLite count，不发网络），非空才触发一轮同步。
+            //   这样命令、agent 工具、扩展桥、周期滚动等所有写路径都被覆盖，
+            //   不必在每处埋调用点。
+            // - 远端变更：每 5 分钟强制对一轮（手机上改的东西落到桌面）。
+            // 都走 sync_auto（内部 20s 节流）；未开启同步时是空操作。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    let mut since_forced = std::time::Instant::now();
+                    loop {
+                        let has_pending = {
+                            let state = handle.state::<DbState>();
+                            let pending = match state.0.lock() {
+                                Ok(conn) => crate::sync::repo::outbox_list(&conn, 1)
+                                    .map(|v| !v.is_empty())
+                                    .unwrap_or(false),
+                                Err(_) => false,
+                            };
+                            pending
+                        };
+                        let force = since_forced.elapsed() >= std::time::Duration::from_secs(300);
+                        if has_pending || force {
+                            if force {
+                                since_forced = std::time::Instant::now();
+                            }
+                            let state = handle.state::<DbState>();
+                            if let Err(e) = crate::sync::commands::sync_auto(handle.clone(), state).await {
+                                log::warn!("[云同步] 自动同步失败: {e}");
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                });
+            }
 
             // 平台模型清单启动对账（约定 33 自愈）：客户端快照只在「打开平台额度开关」
             // 那一刻拉过一次，服务端后台加减模型后不会自己更新。延后 8s 静默对账一次
@@ -812,10 +895,14 @@ pub fn run() {
                 // 启动即前台：避免窗口偶尔出现在其他窗口后面；稍等再补一次焦点，
                 // 绕开 Windows 前台锁定的瞬时限制
                 let _ = window.set_focus();
+                crate::webview_focus::focus_webview(app.handle(), "main");
                 let handle = window.clone();
+                let app_handle = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     let _ = handle.set_focus();
+                    // 首帧渲染完 webview 子窗才稳定：这时再补一次键盘焦点（同上）
+                    crate::webview_focus::focus_webview(&app_handle, "main");
                 });
             }
 
@@ -877,6 +964,10 @@ pub fn run() {
             // （全部页面收进 tab；无条件预创建隐藏常驻，运行期只 show/hide/navigate/set_bounds，见 suda_browser.rs）
             suda_browser::init(app.handle());
 
+            // 截图 / GIF 录屏：选区覆盖层 + 录制控制条（无条件预创建隐藏常驻，
+            // 运行期只重定位 + 显隐，绝不建窗——快捷键触发必须即时弹出，见 recorder.rs）
+            recorder::init(app.handle());
+
             // WebView2 内存级别联动（P0，webview_mem.rs）：窗口隐藏时把常驻 renderer
             // 的内存目标级别设为 Low（弃缓存换页、脚本照常跑），显示前恢复 Normal。
             // 快路径接在各显隐函数里，这里起的是 300ms 轮询纠偏兜底线程
@@ -905,6 +996,19 @@ pub fn run() {
                             crate::floating_ball::set_main_minimized(&app_handle, minimized);
                             schedule_geometry_save(&app_handle);
                         }
+                        // 从别的应用切回主窗（点任务栏 / Alt+Tab / 点窗口任意处）：把键盘
+                        // 焦点补进 webview。窗口被激活 ≠ 焦点进了页面，缺这一刀就是
+                        // 「切回来按 ESC 没反应，得先点一下」（见 webview_focus.rs）
+                        tauri::WindowEvent::Focused(true) => {
+                            crate::webview_focus::focus_webview(&app_handle, "main");
+                            // 切回窗口顺手对账一次（协议 §6.4 档 0）：节流在命令内部，
+                            // 未开启云同步时是空操作
+                            let h = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = h.state::<DbState>();
+                                let _ = crate::sync::commands::sync_auto(h.clone(), state).await;
+                            });
+                        }
                         _ => {}
                     }
                 });
@@ -920,6 +1024,31 @@ pub fn run() {
             let app_handle = app.handle().clone();
             app.listen("clipboard-toggle", move |_| {
                 crate::clipboard::toggle_overlay(&app_handle);
+            });
+
+            // 截图快捷键事件：唤起选区层（shot 模式，框选松手直接出图）。
+            // 主窗可能正隐藏着，必须在这里（Rust 侧）处理而非主窗前端。
+            // open_overlay 内部说明：事件回调不在主线程，可安全操作窗口
+            let app_handle = app.handle().clone();
+            app.listen("shot-shortcut", move |_| {
+                if let Err(e) = crate::recorder::open_overlay(&app_handle, crate::recorder::OverlayMode::Shot) {
+                    log::warn!("[截图] 唤起选区层失败: {e}");
+                }
+            });
+
+            // GIF 录制快捷键事件：唤起选区层（record 模式，框选后设帧率/时长再录）
+            let app_handle = app.handle().clone();
+            app.listen("recorder-shortcut", move |_| {
+                if let Err(e) = crate::recorder::open_overlay(&app_handle, crate::recorder::OverlayMode::Record) {
+                    log::warn!("[GIF 录制] 唤起选区层失败: {e}");
+                }
+            });
+
+            // 选区层 Esc 快捷取消（全局热键动态注册，recorder.rs::register_esc_hotkey）：
+            // 不依赖键盘焦点——SetForegroundWindow 前台锁定下 webview 可能收不到按键
+            let app_handle = app.handle().clone();
+            app.listen("recorder-overlay-esc", move |_| {
+                crate::recorder::hide_overlay(&app_handle);
             });
 
             // 搜索快捷键事件：唤起主窗（对话框由主窗前端收到同名事件后打开）
@@ -970,6 +1099,17 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_initial_data,
+            sync::commands::sync_status,
+            sync::commands::sync_enable,
+            sync::commands::sync_begin_pairing,
+            sync::commands::sync_poll_pairing,
+            sync::commands::sync_pairing_cancel,
+            sync::commands::sync_now,
+            sync::commands::sync_auto,
+            commands::set_sync_auto_enabled,
+            sync::commands::sync_device_list,
+            sync::commands::sync_revoke_device,
+            sync::commands::sync_disable,
             commands::list_resources,
             commands::create_resource,
             commands::update_resource,
@@ -1012,8 +1152,9 @@ pub fn run() {
             note_io::export_notes,
             note_io::import_notes,
             note_io::import_notes_cancel,
-            // 随手导出（单条/整夹 × Markdown/HTML/PDF，见 note_io.rs #t69）
+            // 随手导出（单条/整夹 × Markdown/HTML/PDF，表格笔记单条另有 Excel，见 note_io.rs #t69）
             note_io::export_note_file,
+            note_io::export_note_sheet,
             note_io::export_notes_of_folder,
             note_io::export_notes_cancel,
             commands::list_todos,
@@ -1025,6 +1166,7 @@ pub fn run() {
             commands::set_todo_notify_mode,
             commands::reorder_todo_orders,
             commands::move_todo_child,
+            commands::detach_todo_child,
             commands::set_todo_description,
             commands::set_todo_pinned,
             commands::set_todo_repeat,
@@ -1073,7 +1215,23 @@ pub fn run() {
             commands::set_search_shortcut,
             commands::set_chat_shortcut,
             commands::set_notes_shortcut,
+            commands::set_shot_shortcut,
+            commands::set_recorder_shortcut,
             commands::set_shortcut_enabled,
+            // 截图 / GIF 录屏（recorder.rs）：选区层 + 控制条 + 产物落盘
+            recorder::recorder_open_overlay,
+            recorder::recorder_close_overlay,
+            recorder::recorder_start,
+            recorder::recorder_stop,
+            recorder::recorder_cancel,
+            recorder::recorder_capture_shot,
+            recorder::recorder_reveal,
+            // 贴图（盯住）：钉屏展示截图
+            recorder::recorder_pin_shot,
+            recorder::recorder_pin_take,
+            recorder::recorder_pin_close,
+            // 窗口自动识别：用户首次交互后停跟随
+            recorder::recorder_hover_lock,
             commands::get_run_at_startup,
             commands::set_run_at_startup,
             commands::get_startup_hidden,
@@ -1110,6 +1268,8 @@ pub fn run() {
             commands::set_note_tags,
             commands::list_note_tags,
             commands::backup_data,
+            commands::pick_save_path,
+            commands::export_todos,
             commands::restore_data,
             commands::get_data_path,
             commands::change_data_dir,
@@ -1133,6 +1293,7 @@ pub fn run() {
             commands::set_chat_panel,
             commands::get_chat_panel,
             commands::set_chat_panel_side,
+            commands::set_chat_selected_model,
             commands::get_ui_config,
             chat_window::chat_window_get_state,
             chat_window::chat_window_toggle,

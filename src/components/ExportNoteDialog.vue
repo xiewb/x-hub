@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref, toRef, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, toRef, watch } from 'vue'
 import { useFocusTrap } from '../composables/useFocusTrap'
 import type { ExportFormat } from '../utils/noteExport'
 
 /**
  * 速记随手导出弹窗（单条/整夹共用，2026-10-22 #t69）：
  * 格式三选一（Markdown / HTML / PDF）+ 确定；整夹批量时切进度态（逐条 PDF 较慢，可取消）。
+ * 整夹可勾「合并为一个文件」（子树笔记写进同一文件，另存为单个文件）。
+ * 单条且目标是表格笔记（kind='sheet'）时在最前多一项 Excel（.xlsx）并默认选中（2026-10-31）。
  * 导出动作由宿主（SpeednoteView）执行，本组件只管选格式与展示进度。
  */
 const props = defineProps<{
@@ -14,19 +16,25 @@ const props = defineProps<{
   kind: 'note' | 'folder'
   /** 笔记标题 / 文件夹名（展示用） */
   title: string
+  /** 目标是否表格笔记（仅 kind='note' 有意义；true 时多出 Excel 格式） */
+  sheet: boolean
   busy: boolean
   progress: { done: number; total: number } | null
 }>()
 
-const emit = defineEmits<{ confirm: [format: ExportFormat]; cancel: []; cancelExport: [] }>()
+const emit = defineEmits<{ confirm: [format: ExportFormat, merged: boolean]; cancel: []; cancelExport: [] }>()
 
 const format = ref<ExportFormat>('markdown')
+const merged = ref(false)
 
-// 每次打开重置为 Markdown（最高频选择）
+// 每次打开重置默认格式（表格笔记默认 Excel，其余默认 Markdown，均为最高频选择）+ 不合并（默认每条一个文件）
 watch(
   () => props.visible,
   (on) => {
-    if (on) format.value = 'markdown'
+    if (on) {
+      format.value = props.kind === 'note' && props.sheet ? 'excel' : 'markdown'
+      merged.value = false
+    }
   },
 )
 
@@ -40,7 +48,7 @@ function onKeydown(e: KeyboardEvent) {
     emit('cancel')
   } else if (e.key === 'Enter') {
     e.preventDefault()
-    emit('confirm', format.value)
+    emit('confirm', format.value, merged.value)
   }
 }
 
@@ -58,11 +66,18 @@ onBeforeUnmount(() => {
   if (typeof window !== 'undefined') window.removeEventListener('keydown', onKeydown)
 })
 
-const options: { value: ExportFormat; label: string; desc: string }[] = [
-  { value: 'markdown', label: 'Markdown（.md）', desc: '通用笔记格式，图片存到旁边的 assets 文件夹' },
-  { value: 'html', label: 'HTML（.html）', desc: '单文件网页，双击即可查看，图片内嵌其中' },
-  { value: 'pdf', label: 'PDF（.pdf）', desc: '适合打印与分享，文字可选中、可搜索' },
-]
+/** 表格笔记在最前多一项 Excel（整夹导出不出现——合并/逐条的表格处置是另一个话题） */
+const options = computed<{ value: ExportFormat; label: string; desc: string }[]>(() => {
+  const base: { value: ExportFormat; label: string; desc: string }[] = [
+    { value: 'markdown', label: 'Markdown（.md）', desc: '通用笔记格式，图片存到旁边的 assets 文件夹' },
+    { value: 'html', label: 'HTML（.html）', desc: '单文件网页，双击即可查看，图片内嵌其中' },
+    { value: 'pdf', label: 'PDF（.pdf）', desc: '适合打印与分享，文字可选中、可搜索' },
+  ]
+  if (props.kind === 'note' && props.sheet) {
+    base.unshift({ value: 'excel', label: 'Excel（.xlsx）', desc: '电子表格格式，可用 Excel / WPS 打开继续编辑' })
+  }
+  return base
+})
 </script>
 
 <template>
@@ -86,10 +101,22 @@ const options: { value: ExportFormat; label: string; desc: string }[] = [
             </label>
           </div>
 
+          <label
+            v-if="kind === 'folder'"
+            class="export-opt export-merge"
+            :class="{ on: merged }"
+          >
+            <input v-model="merged" type="checkbox" name="export-merge" />
+            <span class="export-opt-label">合并为一个文件</span>
+            <span class="export-opt-desc">所有笔记（含子文件夹）按顺序写进同一个文件</span>
+          </label>
+
           <p class="export-hint">
             {{
               kind === 'folder'
-                ? '将导出到所选目录下以文件夹名命名的子目录，每条笔记一个文件'
+                ? merged
+                  ? '将整棵子树的笔记合并写入一个文件，保存时指定文件名与位置'
+                  : '将导出到所选目录下以文件夹名命名的子目录，每条笔记一个文件'
                 : '选择保存位置后自动生成'
             }}
           </p>
@@ -99,7 +126,7 @@ const options: { value: ExportFormat; label: string; desc: string }[] = [
             <button
               type="button"
               class="export-btn export-btn--primary"
-              @click="emit('confirm', format)"
+              @click="emit('confirm', format, merged)"
             >
               导出
             </button>
@@ -151,6 +178,9 @@ const options: { value: ExportFormat; label: string; desc: string }[] = [
   display: flex;
   flex-direction: column;
   gap: 6px;
+  margin-bottom: 6px;
+}
+.export-merge {
   margin-bottom: 12px;
 }
 .export-opt {

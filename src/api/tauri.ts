@@ -35,6 +35,12 @@ export interface SudaCustomModuleConfig {
   resource_ids: number[]
 }
 
+/** 工作台自定义布局方案（最多保存 3 个；layout 为 placements JSON 数组字符串） */
+export interface DashboardLayoutPreset {
+  name: string
+  layout: string
+}
+
 /** 本机已安装浏览器（list_installed_browsers，注册表 StartMenuInternet 枚举） */
 export interface InstalledBrowser {
   /** 显示名（如 Google Chrome / Microsoft Edge） */
@@ -293,10 +299,14 @@ export interface AppConfig {
   dashboard_layout: string
   /** 用户保存的默认布局快照（placements JSON 数组字符串；空串 = 未保存过，恢复默认不可用） */
   dashboard_default_layout: string
+  /** 用户保存的自定义布局方案（最多 3 个；不含当前生效布局） */
+  dashboard_layout_presets: DashboardLayoutPreset[]
   countdown_sound: boolean
   clock_quote: string // 时钟卡片语录（可配置，空串回退默认）
   notice_duration_ms: number // 右下角通知弹窗驻留时长（毫秒，1000–60000）
   online_enabled: boolean // 联网功能总开关（默认开）
+  /** 云同步「自动同步」开关（默认关）：开 = outbox 非空 / 定时 / 聚焦自动同步；关 = 只手动「立即同步」 */
+  sync_auto_enabled: boolean
   /** AI 助手默认权限档：readonly（仅可查看）/ ask（每次都问，默认）/ full（完全权限）。
    *  对话框快捷切换未手动调整时以此初始化；后端命令缺省回落同款安全默认 ask */
   agent_permission_mode: string
@@ -324,6 +334,8 @@ export interface AppConfig {
   chat_panel_height: number
   /** AI 对话是否以独立窗口打开（false = 主窗内嵌抽屉） */
   chat_window_mode: boolean
+  /** 全局记住的 AI 对话模型选择（无会话态/新建会话使用；空串 = 未设置） */
+  chat_selected_model: string
   /** AI 对话独立窗口尺寸（逻辑 px，由后端拖拽/缩放记忆） */
   chat_window_width: number
   chat_window_height: number
@@ -340,12 +352,22 @@ export interface AppConfig {
   chat_shortcut: string
   /** 速记呼出快捷键（默认 Ctrl+Shift+N）：唤起主窗→切速记视图→聚焦新建 */
   notes_shortcut: string
+  /** 截图呼出快捷键（默认 Ctrl+Shift+A）：唤起选区层，框选松手直接出图 */
+  shot_shortcut: string
+  /** GIF 录制呼出快捷键（默认 Ctrl+Shift+G）：唤起选区层，框选后设帧率/时长再录 */
+  recorder_shortcut: string
+  /** GIF 保存目录（空 = 默认 数据根\captures；失效时后端自动回退默认） */
+  recorder_save_dir: string
+  /** GIF 录制默认帧率（1-60，默认 20；选区层不再逐次选择） */
+  recorder_fps: number
   /** 各全局快捷键是否启用（默认开）：关掉 = 注销热键但保留键值，重开即恢复 */
   global_shortcut_enabled: boolean
   clipboard_shortcut_enabled: boolean
   search_shortcut_enabled: boolean
   chat_shortcut_enabled: boolean
   notes_shortcut_enabled: boolean
+  shot_shortcut_enabled: boolean
+  recorder_shortcut_enabled: boolean
   /** 剪贴板历史最大条数（含置顶） */
   clipboard_max_items: number
   /** 非置顶记录保留天数 */
@@ -1015,6 +1037,52 @@ export interface Countdown {
   updated_at: string
 }
 
+// ---- 截图 / GIF 录屏（recorder.rs） ----
+
+/** 屏幕区域（物理像素、屏幕坐标） */
+export interface RecRegion {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** GIF 录制结果 */
+export interface RecorderResult {
+  path: string
+  width: number
+  height: number
+  frames: number
+  duration_ms: number
+  size_bytes: number
+}
+
+/** 截图标注：一笔/一形 = 归一化坐标（相对选区左上角 0..1）。
+ *  stroke 用 points（轨迹点列）；rect / ellipse 用 x/y/w/h（归一化包围盒） */
+export interface CaptureAnnotation {
+  kind: 'stroke' | 'rect' | 'ellipse'
+  points?: [number, number][]
+  x?: number
+  y?: number
+  w?: number
+  h?: number
+}
+
+/** 截图结果（图已复制剪贴板，不落盘） */
+export interface CaptureShotResult {
+  width: number
+  height: number
+  size_bytes: number
+}
+
+/** 贴图结果（图同时在剪贴板 + 钉屏展示） */
+export interface PinShotResult {
+  slot: number
+  path: string
+  width: number
+  height: number
+}
+
 export interface DroppedAppInfo {
   name: string
   target: string
@@ -1210,6 +1278,44 @@ export interface AgentApprovalAsk {
   level: string
 }
 
+// ---- 云同步（docs/sync-protocol.md：E2EE，口令只在设备本地派生）----
+
+/** sync_status 首屏总状态 */
+export interface SyncStatus {
+  paired: boolean
+  keyReady: boolean
+  spaceId: string | null
+  deviceId: string | null
+  pullSeq: number
+  /** outbox 待推条数 */
+  pending: number
+  keyVersion: number
+}
+
+/** GET /sync/devices 的设备行（created_at / last_seen_at 为 ms；last_seen_at null = 从未连接） */
+export interface SyncDeviceInfo {
+  id: string
+  kind: 'desktop' | 'mini' | string
+  name: string
+  created_at: number
+  last_seen_at: number | null
+}
+
+/** sync_now 一轮结果（applied = 远端落库条数，pushed = 本端推送成功条数） */
+export interface SyncNowResult {
+  applied: number
+  pushed: number
+  failed: number
+  /** 服务端按条拒收、已跳过 outbox 的条目数（数据本身不可接受，重试也不会成功） */
+  rejected?: number
+}
+
+/** sync_poll_pairing：pending / completed / expired / cancelled */
+export interface SyncPairingPoll {
+  status: string
+  deviceName: string | null
+}
+
 export const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
 export const tauriApi = {
@@ -1393,16 +1499,32 @@ export const tauriApi = {
       format,
       bodyHtml: bodyHtml ?? null,
     }),
-  /** 整夹导出：落 <dir>/<文件夹名>/，每条一个文件；批量 PDF 逐条 emit note-export-progress */
+  /**
+   * 随手导出表格笔记为 Excel（.xlsx，弹窗仅表格笔记出现）：
+   * excelB64 = null 时 Rust 直拷落盘的 xlsx 原文件（保真最高）；
+   * csv 落盘的表格由前端转成 xlsx 字节后传 base64（见 noteSheet.sheetExcelExportB64）。
+   */
+  exportNoteSheet: (id: number, path: string, excelB64: string | null) =>
+    invoke<{ exported: number; failed: string[]; dir: string }>('export_note_sheet', {
+      id,
+      path,
+      excelB64,
+    }),
+  /**
+   * 整夹导出：merged=false 落 <dir>/<文件夹名>/，每条一个文件（dir 为所选目录）；
+   * merged=true（弹窗勾「合并为一个文件」）时 dir 为目标**文件**路径，子树笔记合并写进同一文件。
+   * 批量 PDF 逐条 emit note-export-progress（合并 PDF 整篇一次渲染，无逐条进度）。
+   */
   exportNotesOfFolder: (
     folderId: number,
     dir: string,
     format: 'markdown' | 'html' | 'pdf',
     bodies: { id: number; html: string }[],
+    merged: boolean,
   ) =>
     invoke<{ exported: number; images: number; failed: string[]; dir: string; cancelled: boolean }>(
       'export_notes_of_folder',
-      { folderId, dir, format, bodies },
+      { folderId, dir, format, bodies, merged },
     ),
   /** 取消正在进行的整夹导出（幂等） */
   exportNotesCancel: () => invoke<void>('export_notes_cancel'),
@@ -1432,9 +1554,11 @@ export const tauriApi = {
     invoke<Todo>('set_todo_notify_mode', { id, mode }),
   /** 待办拖拽排序：按传入顺序写入手动排序位（前端按分组计算完整顺序） */
   reorderTodoOrders: (ids: number[]) => invoke<void>('reorder_todo_orders', { ids }),
-  /** 跨父拖拽：子待办改挂到另一个顶级父待办，并重写目标父下子项顺序 */
+  /** 跨父拖拽：子待办改挂到另一个顶级父待办（或无子待办的一级改挂为子待办），并重写目标父下子项顺序 */
   moveTodoChild: (id: number, newParentId: number, orderedIds: number[]) =>
     invoke<Todo>('move_todo_child', { id, newParentId, orderedIds }),
+  /** 子待办升回顶级（拖到列表空白处）：parent_id 与 sort_order 一并清空 */
+  detachTodoChild: (id: number) => invoke<Todo>('detach_todo_child', { id }),
   /** 设置待办描述（轻量 Markdown） */
   setTodoDescription: (id: number, description: string) =>
     invoke<Todo>('set_todo_description', { id, description }),
@@ -1535,6 +1659,10 @@ export const tauriApi = {
   setNoteTags: (noteId: number, tagIds: number[]) =>
     invoke<void>('set_note_tags', { noteId, tagIds }),
   listNoteTags: () => invoke<NoteTagRow[]>('list_note_tags'),
+  /** 待办视图一键导出：Rust 侧弹保存对话框（绕过插件 ACL，dev/prod 行为一致），None = 用户取消 */
+  pickSavePath: (defaultName: string) => invoke<string | null>('pick_save_path', { defaultName }),
+  /** 待办视图一键导出：内容前端按当前筛选组装好，这里只写盘到保存对话框选定的路径 */
+  exportTodos: (path: string, content: string) => invoke<void>('export_todos', { path, content }),
   backupData: (targetDir: string) => invoke<string>('backup_data', { targetDir }),
   restoreData: (source: string) => invoke<void>('restore_data', { source }),
   getDataPath: () => invoke<DataPathInfo>('get_data_path'),
@@ -1550,9 +1678,38 @@ export const tauriApi = {
   setSearchShortcut: (value: string) => invoke<string>('set_search_shortcut', { value }),
   setChatShortcut: (value: string) => invoke<string>('set_chat_shortcut', { value }),
   setNotesShortcut: (value: string) => invoke<string>('set_notes_shortcut', { value }),
+  setShotShortcut: (value: string) => invoke<string>('set_shot_shortcut', { value }),
+  setRecorderShortcut: (value: string) => invoke<string>('set_recorder_shortcut', { value }),
   /** 启用/禁用某个可自定义全局快捷键（禁用保留键值，只注销热键） */
-  setShortcutEnabled: (kind: 'main' | 'clipboard' | 'search' | 'chat' | 'notes', enabled: boolean) =>
+  setShortcutEnabled: (kind: 'main' | 'clipboard' | 'search' | 'chat' | 'notes' | 'shot' | 'recorder', enabled: boolean) =>
     invoke<void>('set_shortcut_enabled', { kind, enabled }),
+  // ---- 截图 / GIF 录屏（recorder.rs；选区层与控制条两窗由后端预创建复用） ----
+  /** 唤起全屏选区层（mode：shot 框选松手即出图 / record 框选后设帧率时长再录） */
+  recorderOpenOverlay: (mode: 'shot' | 'record') =>
+    invoke<void>('recorder_open_overlay', { mode }),
+  /** 收起选区层（Esc 取消；只隐藏，窗口复用） */
+  recorderCloseOverlay: () => invoke<void>('recorder_close_overlay'),
+  /** 截图：框选区域采单帧 + 标注（画笔/矩形/圆形）合成，复制剪贴板（不落盘） */
+  recorderShot: (region: RecRegion, annotations: CaptureAnnotation[]) =>
+    invoke<CaptureShotResult>('recorder_capture_shot', { region, annotations }),
+  /** 贴图（盯住）：同款采屏+剪贴板，图钉到选区原位置置顶展示 */
+  recorderPinShot: (region: RecRegion, annotations: CaptureAnnotation[]) =>
+    invoke<PinShotResult>('recorder_pin_shot', { region, annotations }),
+  /** 贴图窗口拉取自己的截图 asset URL（挂载后调用） */
+  recorderPinTake: () => invoke<string>('recorder_pin_take'),
+  /** 关闭贴图：清 slot + 删 pins 文件 + 收窗 */
+  recorderPinClose: () => invoke<void>('recorder_pin_close'),
+  /** 用户开始手动交互：停掉窗口自动识别跟随（选框交还用户） */
+  recorderHoverLock: () => invoke<void>('recorder_hover_lock'),
+  /** 开始 GIF 录制（fps 省略时用设置默认值 recorder_fps；maxSeconds 1-300） */
+  recorderStart: (region: RecRegion, fps: number | null, maxSeconds: number) =>
+    invoke<void>('recorder_start', { region, fps, maxSeconds }),
+  /** 停止录制并编码 GIF（控制条留在已保存态） */
+  recorderStop: () => invoke<RecorderResult>('recorder_stop'),
+  /** 取消录制：丢弃数据并清临时文件 */
+  recorderCancel: () => invoke<void>('recorder_cancel'),
+  /** 在资源管理器中定位产物文件 */
+  recorderReveal: (path: string) => invoke<void>('recorder_reveal', { path }),
   getRunAtStartup: () =>
     invoke<AutostartStatus>('get_run_at_startup'),
   setRunAtStartup: (enabled: boolean) => invoke<void>('set_run_at_startup', { enabled }),
@@ -1677,6 +1834,8 @@ export const tauriApi = {
     invoke<void>('set_chat_panel', { width, height, open }),
   getChatPanel: () => invoke<[number, number, boolean]>('get_chat_panel'),
   setChatPanelSide: (side: string) => invoke<void>('set_chat_panel_side', { side }),
+  /** 全局记住 AI 对话模型选择（后端锁内读改写，主窗/独立窗共用不冲配置） */
+  setChatSelectedModel: (name: string) => invoke<void>('set_chat_selected_model', { name }),
   // ---- AI 对话独立窗口（与主窗内嵌抽屉互斥，窗口常驻隐藏、只做 show/hide） ----
   chatWindowGetState: () => invoke<ChatWindowState>('chat_window_get_state'),
   chatWindowToggle: () => invoke<void>('chat_window_toggle'),
@@ -1915,4 +2074,29 @@ export const tauriApi = {
   /** 桥 API 统一分发：扩展 iframe 经主窗口转发调用 */
   xhubCall: (extId: string, namespace: string, method: string, args: unknown) =>
     invoke<unknown>('xhub_call', { extId, namespace, method, args }),
+  // ---- 云同步（docs/sync-protocol.md §8.3 的 9 条命令）----
+  /** 同步总状态（SyncPanel 首屏） */
+  syncStatus: () => invoke<SyncStatus>('sync_status'),
+  /** 开启云同步：设口令 → 派生 → 建空间；口令至少 8 位，失败抛中文错误 */
+  syncEnable: (passphrase: string) =>
+    invoke<{ spaceId: string; deviceId: string }>('sync_enable', { passphrase }),
+  /** 出配对二维码：返回二维码内容 JSON 字符串（只含一次性配对凭据，无任何密钥） */
+  syncBeginPairing: () => invoke<string>('sync_begin_pairing'),
+  /** 轮询配对状态（弹窗打开期间 2s 一次） */
+  syncPollPairing: (pairingId: string) =>
+    invoke<SyncPairingPoll>('sync_poll_pairing', { pairingId }),
+  /** 自动同步（聚焦/定时/配对完成后由后端自触发；受「自动同步」开关门控，前端一般不用手动调） */
+  syncAuto: () => invoke<SyncNowResult & { skipped?: boolean; reason?: string }>('sync_auto'),
+  /** 云同步「自动同步」开关：开 = 后台触发点自动同步；关 = 只手动「立即同步」 */
+  setSyncAutoEnabled: (enabled: boolean) => invoke<boolean>('set_sync_auto_enabled', { enabled }),
+  /** 取消配对会话（关闭二维码 / 过期时） */
+  syncPairingCancel: (pairingId: string) => invoke<void>('sync_pairing_cancel', { pairingId }),
+  /** 一次完整同步轮（pull → push）；应用过远端数据则后端广播 sync-applied */
+  syncNow: () => invoke<SyncNowResult>('sync_now'),
+  /** 设备列表（本空间的活跃设备） */
+  syncDeviceList: () => invoke<{ devices: SyncDeviceInfo[] }>('sync_device_list'),
+  /** 撤销某台设备（主人操作，撤销后该设备需重新扫码） */
+  syncRevokeDevice: (deviceId: string) => invoke<unknown>('sync_revoke_device', { deviceId }),
+  /** 关闭本机同步：吊销自己的设备行 + 清本地钥匙（云端密文保留） */
+  syncDisable: () => invoke<{ ok: boolean }>('sync_disable'),
 }

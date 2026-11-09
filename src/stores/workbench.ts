@@ -1,5 +1,6 @@
 import { reactive, readonly } from 'vue'
 import { normalizeNoteEditorMode } from '../utils/noteEditorMode'
+import { needsFullNoteFetch } from '../utils/noteRefresh'
 import { compareByOrder, groupOf } from '../utils/todoSchedule'
 import { isHttpWebTarget } from '../utils/web'
 import {
@@ -8,6 +9,7 @@ import {
   type AppConfig,
   type ChatModelConfig,
   type Countdown,
+  type DashboardLayoutPreset,
   type DetachedSticky,
   type GeoLocation,
   type Note,
@@ -38,7 +40,7 @@ import {
 const WRITE_CMD_DOMAIN: Record<string, string> = {
   // todos / todo-tags
   createTodo: 'todos', toggleTodo: 'todos', updateTodo: 'todos', deleteTodo: 'todos',
-  scheduleTodo: 'todos', setTodoNotifyMode: 'todos', reorderTodoOrders: 'todos', moveTodoChild: 'todos',
+  scheduleTodo: 'todos', setTodoNotifyMode: 'todos', reorderTodoOrders: 'todos', moveTodoChild: 'todos', detachTodoChild: 'todos',
   setTodoDescription: 'todos', setTodoPinned: 'todos', setTodoRepeat: 'todos',
   completeTodoRecurring: 'todos', undoTodoRecurring: 'todos',
   createTodoTag: 'todoTags', updateTodoTag: 'todoTags', deleteTodoTag: 'todoTags', setTodoTags: 'todoTags',
@@ -144,6 +146,7 @@ const state = reactive<StoreState>({
     theme_mode: 'light',
     theme_preset: 'indigo',
     accent_color: null,
+    sync_auto_enabled: false,
     wallpaper_path: '',
     wallpaper_blur: true,
     wallpaper_veil: 0.3,
@@ -161,6 +164,7 @@ const state = reactive<StoreState>({
     dashboard_mid_content: 'countdown',
     dashboard_layout: '',
     dashboard_default_layout: '',
+    dashboard_layout_presets: [],
     countdown_sound: false,
     clock_quote: '',
     notice_duration_ms: 5000,
@@ -177,6 +181,7 @@ const state = reactive<StoreState>({
     chat_panel_height: 380,
     chat_panel_opacity: 1,
     chat_window_mode: false,
+    chat_selected_model: '',
     chat_window_width: 460,
     chat_window_height: 640,
     chat_window_x: null,
@@ -186,11 +191,17 @@ const state = reactive<StoreState>({
     search_shortcut: DEFAULT_SEARCH_SHORTCUT,
     chat_shortcut: DEFAULT_CHAT_SHORTCUT,
     notes_shortcut: IS_MAC_PREVIEW ? 'CommandOrControl+Shift+N' : 'Ctrl+Shift+N',
+    shot_shortcut: IS_MAC_PREVIEW ? 'CommandOrControl+Shift+A' : 'Ctrl+Shift+A',
+    recorder_shortcut: IS_MAC_PREVIEW ? 'CommandOrControl+Shift+G' : 'Ctrl+Shift+G',
+    recorder_save_dir: '',
+    recorder_fps: 20,
     global_shortcut_enabled: true,
     clipboard_shortcut_enabled: true,
     search_shortcut_enabled: true,
     chat_shortcut_enabled: true,
     notes_shortcut_enabled: true,
+    shot_shortcut_enabled: true,
+    recorder_shortcut_enabled: true,
     note_trash_retention_days: 0,
     clipboard_max_items: 500,
     clipboard_ttl_days: 7,
@@ -305,6 +316,15 @@ export function useStore() {
         if (isSelfWriteEcho('resources')) return
         void refreshResources()
         void refreshSubcategories()
+      })
+      // 云同步引擎应用了远端变更（Rust 直写库，不走 *-changed 命令通道，见 docs/sync-protocol.md §6.4）：
+      // 不做 isSelfWriteEcho 判断——同步写库与 UI 命令无关，直接全量重载相关数据
+      void listen('sync-applied', () => {
+        void refreshTodos()
+        void refreshTodoTags()
+        void refreshNotes()
+        void refreshNoteFolders()
+        void refreshNoteTagRows()
       })
     })
   }
@@ -689,6 +709,13 @@ export function useStore() {
     await tauriApi.saveConfig(state.config)
   }
 
+  /** 云同步「自动同步」开关：专属命令锁内落盘（不走 saveConfig 整体写，双写已去） */
+  async function setSyncAutoEnabled(enabled: boolean) {
+    state.config.sync_auto_enabled = enabled
+    if (!isTauri()) return
+    await tauriApi.setSyncAutoEnabled(enabled)
+  }
+
   /** 显式以独立应用内浏览器窗口打开网页资源（右键菜单，绕过默认打开方式） */
   async function openResourceInWindow(id: number) {
     await tauriApi.sudaBrowserOpen(id)
@@ -802,11 +829,14 @@ export function useStore() {
     state.notes = state.notes.filter((x) => x.id !== id)
   }
 
-  /** 剪贴板浮层等外部保存速记后，主窗口刷新笔记列表（仅拉元信息，轻量）。
+  /** 剪贴板浮层 / AI 助手工具 / 云同步等外部写入后，主窗口刷新笔记列表（仅拉元信息，轻量）。
    *  标签关联一并刷新：外部进程改标签时筛选映射也要跟上。
-   *  ⚠️ list_notes 不含正文：必须按 id 合并保留本地已知 content（外部新建的
-   *  条目单条补拉全量）。整表替换会把所有笔记正文清空，编辑器下次切笔记
-   *  把空正文写回库 = 永久丢稿 */
+   *  ⚠️ list_notes 不含正文：必须按 id 合并保留本地已知 content，整表替换会把所有
+   *  笔记正文清空、编辑器下次切笔记把空正文写回库 = 永久丢稿。
+   *  ⚠️ 但「保留本地正文」的判据必须是 **updated_at 没变**（`needsFullNoteFetch`）：
+   *  只按 id 命中就沿用旧正文，会让外部写入永远进不了界面——AI 助手说「已记录」、
+   *  速记树里搜不到（筛选搜的是 content）、点开还是旧文，重启才出现（2026-11-04 排查）。
+   *  外部新建的条目本来就进不了 byId，同样走这条补拉分支。 */
   async function refreshNotes() {
     if (!isTauri()) return
     const meta = await tauriApi.listNotes()
@@ -814,9 +844,13 @@ export function useStore() {
     state.notes = await Promise.all(
       meta.map(async (m) => {
         const old = byId.get(m.id)
-        if (old) return { ...m, content: old.content }
+        // 版本没变：本地正文即最新，省掉一条 get_note
+        if (!needsFullNoteFetch(old, m)) return { ...m, content: old!.content }
+        // 外部改过/新建：单条补拉全量。拉失败时保留本地正文（旧文总比空文安全——
+        // 空文会被编辑器写回库），本地也没有就只能是元信息（正文为空直到下次打开）
         const full = await tauriApi.getNote(m.id).catch(() => null)
-        return full ?? m
+        if (full) return full
+        return old ? { ...m, content: old.content } : m
       }),
     )
     void refreshNoteTagRows()
@@ -835,6 +869,24 @@ export function useStore() {
       : { id: Date.now(), name, parent_id: parentId, sort_order: 0, builtin: false, created_at: new Date().toISOString() }
     state.noteFolders.push(f)
     return f
+  }
+
+  const DIARY_FOLDER_NAME = '日记'
+
+  /** 标题缺省 = 入库时刻的「年月日 时:分:秒」（工作台日记卡口径） */
+  function formatDiaryTitle(d: Date): string {
+    const p = (n: number) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  }
+
+  /** 存入速记「日记」文件夹：树根按名查找、缺失即建（普通文件夹，改删自由）。
+   *  工作台日记卡与待办视图「加日记」共用这一份，勿再各写一套查找逻辑 */
+  async function saveDiaryEntry(content: string, title?: string) {
+    let folder = state.noteFolders.find(
+      (f) => f.parent_id == null && f.name === DIARY_FOLDER_NAME,
+    )
+    if (!folder) folder = await createNoteFolder(DIARY_FOLDER_NAME, null)
+    return addNote(title ?? formatDiaryTitle(new Date()), folder.id, content)
   }
 
   async function renameNoteFolder(id: number, name: string) {
@@ -1107,6 +1159,32 @@ export function useStore() {
     if (!isTauri()) return
     try {
       await tauriApi.moveTodoChild(id, newParentId, orderedIds)
+    } catch (e) {
+      const byId = new Map(snapshot.map((s) => [s.id, s]))
+      state.todos = state.todos.map((t) => {
+        const s = byId.get(t.id)
+        return s ? { ...t, parent_id: s.parent_id, sort_order: s.sort_order } : t
+      })
+      throw e
+    }
+  }
+
+  /**
+   * 子待办升回顶级（拖到列表空白处）：parent_id 与 sort_order 一并清空（落回分组默认排序）。
+   * 本地乐观更新 + 失败回滚，同 moveTodoChild。
+   */
+  async function detachTodoChild(id: number) {
+    const snapshot = state.todos.map((t) => ({
+      id: t.id,
+      parent_id: t.parent_id,
+      sort_order: t.sort_order,
+    }))
+    state.todos = state.todos.map((t) =>
+      t.id === id ? { ...t, parent_id: null, sort_order: null } : t,
+    )
+    if (!isTauri()) return
+    try {
+      await tauriApi.detachTodoChild(id)
     } catch (e) {
       const byId = new Map(snapshot.map((s) => [s.id, s]))
       state.todos = state.todos.map((t) => {
@@ -1565,9 +1643,39 @@ export function useStore() {
     return saved
   }
 
+  async function setShotShortcut(value: string) {
+    state.config.shot_shortcut = value
+    if (!isTauri()) return value
+    const saved = await tauriApi.setShotShortcut(value)
+    state.config.shot_shortcut = saved
+    return saved
+  }
+
+  async function setRecorderShortcut(value: string) {
+    state.config.recorder_shortcut = value
+    if (!isTauri()) return value
+    const saved = await tauriApi.setRecorderShortcut(value)
+    state.config.recorder_shortcut = saved
+    return saved
+  }
+
+  /** GIF 保存目录（空 = 默认 数据根\captures）；整体 saveConfig 落盘 */
+  async function setRecorderSaveDir(value: string) {
+    state.config.recorder_save_dir = value
+    if (!isTauri()) return
+    await tauriApi.saveConfig(state.config)
+  }
+
+  /** GIF 录制默认帧率（1-60，选区层不再逐次选择）；整体 saveConfig 落盘 */
+  async function setRecorderFps(value: number) {
+    state.config.recorder_fps = Math.min(60, Math.max(1, Math.round(value) || 20))
+    if (!isTauri()) return
+    await tauriApi.saveConfig(state.config)
+  }
+
   /** 启用/禁用某个全局快捷键：禁用 = 后端注销热键但保留键值（重开即恢复），失败回滚内存状态 */
   async function setShortcutEnabled(
-    kind: 'main' | 'clipboard' | 'search' | 'chat' | 'notes',
+    kind: 'main' | 'clipboard' | 'search' | 'chat' | 'notes' | 'shot' | 'recorder',
     enabled: boolean,
   ) {
     const key = (
@@ -1577,6 +1685,8 @@ export function useStore() {
         search: 'search_shortcut_enabled',
         chat: 'chat_shortcut_enabled',
         notes: 'notes_shortcut_enabled',
+        shot: 'shot_shortcut_enabled',
+        recorder: 'recorder_shortcut_enabled',
       } as const
     )[kind]
     const prev = state.config[key]
@@ -1614,6 +1724,13 @@ export function useStore() {
   /** 「系统资源」卡片显示的指标 id 列表（空 = 未自定义，卡片回退内置默认；入口在布局编辑器） */
   async function setSysMonitorMetrics(value: string[]) {
     state.config.sys_monitor_metrics = value
+    if (!isTauri()) return
+    await tauriApi.saveConfig(state.config)
+  }
+
+  /** 用户保存的工作台布局方案（最多 3 个；保存整份配置以保持与其它设置一致） */
+  async function setDashboardLayoutPresets(value: DashboardLayoutPreset[]) {
+    state.config.dashboard_layout_presets = value.slice(0, 3)
     if (!isTauri()) return
     await tauriApi.saveConfig(state.config)
   }
@@ -2144,6 +2261,7 @@ export function useStore() {
     reorderResourcesZoned,
     setSudaWebOpenMode,
     setNoteAiModel,
+    setSyncAutoEnabled,
     openResourceInWindow,
     openWebPanel,
     sudaCustomConfigOf,
@@ -2161,6 +2279,7 @@ export function useStore() {
     refreshNotes,
     refreshNoteTagRows,
     createNoteFolder,
+    saveDiaryEntry,
     renameNoteFolder,
     deleteNoteFolder,
     refreshNoteFolders,
@@ -2180,6 +2299,7 @@ export function useStore() {
     setTodoNotifyMode,
     reorderTodos,
     moveTodoChild,
+    detachTodoChild,
     refreshTodos,
     setTodoDescription,
     setTodoPinned,
@@ -2226,11 +2346,16 @@ export function useStore() {
     setSearchShortcut,
     setChatShortcut,
     setNotesShortcut,
+    setShotShortcut,
+    setRecorderShortcut,
+    setRecorderSaveDir,
+    setRecorderFps,
     setShortcutEnabled,
     setDashboardMidContent,
     setDashboardLayout,
     setDashboardDefaultLayout,
     setSysMonitorMetrics,
+    setDashboardLayoutPresets,
     setCountdownSound,
     setNoticeDuration,
     setClockQuote,

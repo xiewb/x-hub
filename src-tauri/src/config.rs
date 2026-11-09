@@ -58,6 +58,23 @@ pub struct SudaCustomModuleConfig {
     pub resource_ids: Vec<i64>,
 }
 
+/// 工作台自定义布局方案（最多保存 3 个；layout 为 placements JSON 数组字符串）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DashboardLayoutPreset {
+    pub name: String,
+    pub layout: String,
+}
+
+impl Default for DashboardLayoutPreset {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            layout: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -97,6 +114,9 @@ pub struct AppConfig {
     /// 独立于生效布局：编辑器里改布局不影响快照，恢复默认永远回到保存那一刻的样子
     #[serde(default)]
     pub dashboard_default_layout: String,
+    /// 用户保存的自定义布局方案（最多 3 个；不含当前生效布局）
+    #[serde(default)]
+    pub dashboard_layout_presets: Vec<DashboardLayoutPreset>,
     /// 倒计时到点提示音（默认关闭）
     pub countdown_sound: bool,
     /// 时钟卡片语录（工作台时间卡片下方显示的一句话，空串时回退默认）
@@ -108,6 +128,10 @@ pub struct AppConfig {
     /// 联网功能总开关（默认开启）：有网显示在线内容、无网自动隐藏；关闭后完全不发起网络请求
     #[serde(default = "default_true")]
     pub online_enabled: bool,
+    /// 云同步「自动同步」开关（默认关闭）：开启后 outbox 非空 / 定时对账 / 聚焦返回
+    /// 自动跑一轮同步（内部 20s 节流）；关闭则只在用户点「立即同步」时同步
+    #[serde(default)]
+    pub sync_auto_enabled: bool,
     /// Agent 权限三档（#t47）：readonly / ask / full；对话框可临时切换，这里是持久默认档
     #[serde(default = "default_agent_permission_mode")]
     pub agent_permission_mode: String,
@@ -158,6 +182,10 @@ pub struct AppConfig {
     /// AI 对话是否以独立窗口打开（true = 独立小窗，false = 主窗内嵌抽屉，默认）
     #[serde(default)]
     pub chat_window_mode: bool,
+    /// 全局记住的 AI 对话模型选择（无会话态/新建会话使用；空串 = 未设置，回落默认模型）。
+    /// 会话内切模型同时写会话 model_name，打开旧会话仍跟随会话自己的模型
+    #[serde(default)]
+    pub chat_selected_model: String,
     /// AI 对话独立窗口宽度（逻辑 px，由窗口缩放拖拽记忆）
     #[serde(default = "default_chat_window_width")]
     pub chat_window_width: f64,
@@ -183,6 +211,18 @@ pub struct AppConfig {
     /// 速记呼出快捷键（默认 Ctrl+Shift+N，可配置，全局注册；唤起主窗→切速记→聚焦新建）
     #[serde(default = "default_notes_shortcut")]
     pub notes_shortcut: String,
+    /// 截图呼出快捷键（默认 Ctrl+Shift+A，可配置，全局注册；唤起选区层，框选松手直接出图）
+    #[serde(default = "default_shot_shortcut")]
+    pub shot_shortcut: String,
+    /// GIF 录制呼出快捷键（默认 Ctrl+Shift+G，可配置，全局注册；唤起选区层，框选后设参数再录）
+    #[serde(default = "default_recorder_shortcut")]
+    pub recorder_shortcut: String,
+    /// GIF 保存目录（设置 → 功能可选；空 = 默认 数据根\captures，失效时自动回退默认）
+    #[serde(default)]
+    pub recorder_save_dir: String,
+    /// GIF 录制默认帧率（1–60，默认 20；选区层不再逐次选择，统一用此默认值）
+    #[serde(default = "default_recorder_fps")]
+    pub recorder_fps: u32,
     /// 各全局快捷键是否启用（默认开）。关掉 = 注销该热键且不再注册，但**保留已录的键值**，
     /// 重新打开即恢复——比「清空键值」更明确，也不会因录错删空而悄悄失效。
     #[serde(default = "default_true")]
@@ -195,6 +235,10 @@ pub struct AppConfig {
     pub chat_shortcut_enabled: bool,
     #[serde(default = "default_true")]
     pub notes_shortcut_enabled: bool,
+    #[serde(default = "default_true")]
+    pub shot_shortcut_enabled: bool,
+    #[serde(default = "default_true")]
+    pub recorder_shortcut_enabled: bool,
     /// 剪贴板历史最大条数（含置顶；置顶豁免自动清理但计入上限）
     pub clipboard_max_items: i64,
     /// 非置顶记录的保留天数
@@ -398,6 +442,21 @@ fn default_notes_shortcut() -> String {
     crate::shortcut::DEFAULT_NOTES_SHORTCUT.to_string()
 }
 
+/// 截图呼出快捷键默认值（与 shortcut.rs 的 DEFAULT_SHOT_SHORTCUT 同源）
+fn default_shot_shortcut() -> String {
+    crate::shortcut::DEFAULT_SHOT_SHORTCUT.to_string()
+}
+
+/// GIF 录制呼出快捷键默认值（与 shortcut.rs 的 DEFAULT_RECORDER_SHORTCUT 同源）
+fn default_recorder_shortcut() -> String {
+    crate::shortcut::DEFAULT_RECORDER_SHORTCUT.to_string()
+}
+
+/// GIF 录制默认帧率 20fps（BitBlt 采集几 ms/帧，20 已流畅；体积敏感再手动降档）
+fn default_recorder_fps() -> u32 {
+    20
+}
+
 /// 通知驻留时长默认 5 秒
 fn default_notice_duration_ms() -> i64 {
     5000
@@ -504,6 +563,9 @@ pub fn default_floating_ball_buttons() -> Vec<String> {
     .collect()
 }
 
+/// 自定义布局方案的最大保存数量，前后端都按固定槽位口径限制。
+pub const MAX_DASHBOARD_LAYOUT_PRESETS: usize = 3;
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -521,10 +583,12 @@ impl Default for AppConfig {
             dashboard_mid_content: "countdown".to_string(),
             dashboard_layout: String::new(),
             dashboard_default_layout: String::new(),
+            dashboard_layout_presets: Vec::new(),
             countdown_sound: false,
             clock_quote: String::new(),
             notice_duration_ms: default_notice_duration_ms(),
             online_enabled: true,
+            sync_auto_enabled: false,
             agent_permission_mode: default_agent_permission_mode(),
             agent_about_me: String::new(),
             agent_prompt_on_dangerous: false,
@@ -542,6 +606,7 @@ impl Default for AppConfig {
             chat_panel_height: 380.0,
             chat_panel_opacity: 1.0,
             chat_window_mode: false,
+            chat_selected_model: String::new(),
             chat_window_width: default_chat_window_width(),
             chat_window_height: default_chat_window_height(),
             chat_window_x: None,
@@ -551,11 +616,17 @@ impl Default for AppConfig {
             search_shortcut: crate::shortcut::DEFAULT_SEARCH_SHORTCUT.to_string(),
             chat_shortcut: crate::shortcut::DEFAULT_CHAT_SHORTCUT.to_string(),
             notes_shortcut: crate::shortcut::DEFAULT_NOTES_SHORTCUT.to_string(),
+            shot_shortcut: crate::shortcut::DEFAULT_SHOT_SHORTCUT.to_string(),
+            recorder_shortcut: crate::shortcut::DEFAULT_RECORDER_SHORTCUT.to_string(),
+            recorder_save_dir: String::new(),
+            recorder_fps: 20,
             global_shortcut_enabled: true,
             clipboard_shortcut_enabled: true,
             search_shortcut_enabled: true,
             chat_shortcut_enabled: true,
             notes_shortcut_enabled: true,
+            shot_shortcut_enabled: true,
+            recorder_shortcut_enabled: true,
             clipboard_max_items: 500,
             clipboard_ttl_days: 7,
             clipboard_paused: false,
@@ -672,6 +743,12 @@ fn normalize(config: &mut AppConfig) -> bool {
     let mut changed = false;
     if config.clock_quote == "日拱一卒，功不唐捐。" {
         config.clock_quote = String::new();
+        changed = true;
+    }
+    if config.dashboard_layout_presets.len() > MAX_DASHBOARD_LAYOUT_PRESETS {
+        config
+            .dashboard_layout_presets
+            .truncate(MAX_DASHBOARD_LAYOUT_PRESETS);
         changed = true;
     }
     if migrate_legacy_endpoints(config) {
@@ -820,6 +897,7 @@ mod tests {
         assert!(!c.window.always_on_top);
         assert_eq!(c.global_shortcut, crate::shortcut::DEFAULT_TOGGLE_SHORTCUT);
         assert_eq!(c.dashboard_mid_content, "countdown");
+        assert!(c.dashboard_layout_presets.is_empty());
         assert_eq!(c.note_editor_mode, "wysiwyg");
     }
 
@@ -1112,5 +1190,24 @@ mod tests {
         assert!(merged.sidebar_toggle);
         assert_eq!(merged.window.width, 1280.0);
         assert_eq!(merged.dashboard_layout, snapshot.dashboard_layout);
+    }
+
+    #[test]
+    fn normalize_truncates_dashboard_layout_presets() {
+        let mut config = AppConfig::default();
+        config.dashboard_layout_presets = (0..(MAX_DASHBOARD_LAYOUT_PRESETS + 2))
+            .map(|i| DashboardLayoutPreset {
+                name: format!("布局 {i}"),
+                layout: "[]".to_string(),
+            })
+            .collect();
+
+        normalize(&mut config);
+
+        assert_eq!(
+            config.dashboard_layout_presets.len(),
+            MAX_DASHBOARD_LAYOUT_PRESETS
+        );
+        assert_eq!(config.dashboard_layout_presets[0].name, "布局 0");
     }
 }

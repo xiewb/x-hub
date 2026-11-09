@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
-import { Check, ChevronLeft, ChevronRight, ListTodo, Plus, X } from 'lucide-vue-next'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
+import { Check, CheckCheck, ChevronLeft, ChevronRight, Download, ListTodo, Plus, X } from 'lucide-vue-next'
+import { isTauri, tauriApi } from '../api/tauri'
 import { useStore } from '../stores/workbench'
 import type { Todo, TodoOccurrence, TodoTag } from '../api/tauri'
 import { useTodoDrag } from '../composables/useTodoDrag'
 import { useTodoRestore } from '../composables/useTodoRestore'
+import { sanitizeExportFilename } from '../utils/noteExport'
+import { buildTodosMarkdown, type TodoExportItem } from '../utils/todoExport'
+import { calendarCellLabel, calendarDayLabel, festivalOf } from '../utils/lunar'
 import {
   VIEW_GROUP_META,
   addDays,
@@ -14,10 +18,14 @@ import {
   doneAtLabel,
   doneMetaLabel,
   dueBadge,
+  fmtDueFull,
   fmtHM,
   inHorizon,
   isoKey,
+  nextRepeatLabel,
   parseServerDate,
+  repeatEndLabel,
+  repeatLabel,
   startOfDay,
   viewGroupOf,
   type Horizon,
@@ -273,6 +281,25 @@ const weekCells = computed(() => {
   })
 })
 
+/** 日历格标签：key → 组合标签（节日 > 节气 > 初一月名 > 农历日名，口径全在 utils/lunar），
+ *  节日另入 fests 供红字样式。月视图 42 格与周视图 7 格共用；两处都算——周视图跨月边界的
+ *  周不全在月网格覆盖内。 */
+const calLabels = computed(() => {
+  const labels = new Map<string, string>()
+  const fests = new Set<string>()
+  const put = (date: Date, key: string) => {
+    const label = calendarCellLabel(date)
+    if (label) labels.set(key, label)
+    if (festivalOf(date)) fests.add(key)
+  }
+  for (const c of cells.value) put(new Date(`${c.key}T00:00:00`), c.key)
+  for (const c of weekCells.value) put(c.date, c.key)
+  return { labels, fests }
+})
+
+/** 当天明细头部标签：节日 > 节气 > 完整农历（如「九月廿九」） */
+const selectedDayCal = computed(() => calendarDayLabel(new Date(`${selectedDay.value}T00:00:00`)))
+
 /** 周期实例请求序号：快速翻月/切周时先发的响应可能后到，旧月份结果会盖掉新月份 */
 let occurrenceSeq = 0
 
@@ -423,6 +450,21 @@ const {
   // 已完成视图里顺序没有意义（分组也是按完成状态来的），不开放拖拽
   enabled: () => !showDone.value,
   reorder: (ids) => void store.reorderTodos(ids),
+  // 一级拖到另一条中部 = 变为其子待办（有子待办的一级不可整体改挂，保持纯排序）
+  childIdsOf: (pid) => kidsOf.value.get(pid)?.map((t) => t.id) ?? [],
+  nestable: (id) => !(kidsOf.value.get(id)?.length),
+  moveChild: (id, pid, ids) => {
+    void store
+      .moveTodoChild(id, pid, ids)
+      .then(() => {
+        const parent = store.state.todos.find((t) => t.id === pid)
+        showToast(parent ? `已移到「${parent.title}」下作为子待办` : '已移为子待办', {
+          label: '撤销',
+          onClick: () => void store.detachTodoChild(id).catch(() => showToast('恢复失败，请重试')),
+        })
+      })
+      .catch(() => showToast('移动失败，请重试'))
+  },
 })
 provide('todoDragStart', onRowDragStart)
 provide('todoDragId', rowDragId)
@@ -449,6 +491,257 @@ function confirmRemoveTag() {
   const tag = removingTag.value
   removingTag.value = null
   if (tag) void removeTag(tag.id)
+}
+
+// ---- 一键完成逾期：未完成且截止日已过的顶级待办，逐条走行勾选的同一套语义 ----
+// 口径与列表「逾期」分组一致（dueBadge kind='over'，按天判定：截止日早于今天才算逾期）
+const overdueTodos = computed(() =>
+  topTodos.value.filter((t) => !t.done && dueBadge(t, today.value)?.kind === 'over'),
+)
+
+const overdueConfirm = ref(false)
+let completingOverdue = false
+
+/** 确认弹窗文案：「周期滚到下一轮」「子待办一并完成」只在真的会发生时说 */
+const overdueConfirmMessage = computed(() => {
+  const list = overdueTodos.value
+  const parts = [`共 ${list.length} 条逾期待办将标记为完成`]
+  if (list.some((t) => t.repeat_mode !== 'once')) parts.push('周期待办会滚到下一轮')
+  if (list.some((t) => kidsOf.value.get(t.id)?.some((k) => !k.done))) parts.push('其下未完成的子待办一并完成')
+  return `${parts.join('，')}。`
+})
+
+function askCompleteOverdue() {
+  if (overdueTodos.value.length) overdueConfirm.value = true
+}
+
+/**
+ * 行勾选的完整语义（与 TodoRow.applyToggle 同一套，别各写一份）：
+ * 周期待办 = 「完成本轮」、截止滚到下一轮（带撤销提示）；普通待办 = 翻转完成，
+ * 勾上时未完成子待办一并勾上（取消完成不连带走子待办）。
+ * `quiet` = 批量场景：不逐条弹「已滚到…」的撤销提示，由调用方统一汇报。
+ */
+async function applyToggleTodo(t: Todo, quiet = false): Promise<void> {
+  const wasDone = t.done
+  if (!wasDone && t.repeat_mode !== 'once') {
+    const updated = await store.completeTodoRecurring(t.id)
+    if (updated && !quiet) {
+      const next = updated.repeat_mode === 'once' ? '周期已结束' : `已滚到 ${nextRepeatLabel(updated, new Date())}`
+      showToast(next, { label: '撤销', onClick: () => void store.undoTodoRecurring(t.id) })
+    }
+    return
+  }
+  await store.toggleTodo(t.id)
+  if (wasDone) return
+  for (const k of kidsOf.value.get(t.id) ?? []) {
+    if (!k.done) await store.toggleTodo(k.id)
+  }
+}
+
+async function completeOverdue() {
+  overdueConfirm.value = false
+  if (completingOverdue) return
+  const list = overdueTodos.value
+  if (!list.length) return
+  completingOverdue = true
+  let ok = 0
+  try {
+    // 单条失败不中断整批，结尾统一汇报成功数
+    for (const t of list) {
+      try {
+        await applyToggleTodo(t, true)
+        ok++
+      } catch {
+        // 继续处理下一条
+      }
+    }
+  } finally {
+    completingOverdue = false
+  }
+  showToast(ok === list.length ? `已处理 ${ok} 条逾期待办` : `已处理 ${ok}/${list.length} 条，其余没能完成，请重试`)
+}
+
+// ---- 一键导出（内容跟随当前「范围 + 标签 + 未完成/已完成」筛选，即列表正显示的数据） ----
+
+const exporting = ref(false)
+
+/** Todo → 导出条目。日期一律用绝对时间（「今天 18:00」写进文件就失去意义了）；
+ *  优先级/周期文案与行内一致，子待办递归带出 */
+function toExportItem(t: Todo): TodoExportItem {
+  const badges: string[] = []
+  if (t.done) {
+    const done = doneAtLabel(t.completed_at, today.value)
+    badges.push(done ? `已完成 ${done.full}` : '已完成')
+  } else if (t.due_at != null) {
+    badges.push(`截止 ${fmtDueFull(t.due_at)}`)
+  }
+  if (t.priority === 1) badges.push('重要')
+  else if (t.priority === 2) badges.push('紧急')
+  if (t.repeat_mode !== 'once') {
+    const rl = repeatLabel(t)
+    const end = repeatEndLabel(t)
+    badges.push(end ? `${rl}（${end}）` : rl)
+  }
+  const tagNames = store
+    .todoTagIds(t.id)
+    .map((id) => allTags.value.find((x) => x.id === id)?.name ?? '')
+    .filter(Boolean)
+  return {
+    title: t.title,
+    done: t.done,
+    badges,
+    tagNames,
+    children: (kidsOf.value.get(t.id) ?? []).map((k) => toExportItem(k)),
+    description: t.description.trim() || undefined,
+  }
+}
+
+/** 导出为 Markdown：按视图分组（置顶/逾期/今天/本周…）组装 → 保存对话框选路径 → 落盘 */
+async function exportTodos() {
+  if (!isTauri() || exporting.value || !visible.value.length) return
+  const scopeLabel = HORIZONS.find((h) => h.key === horizon.value)?.label ?? '全部'
+  const filters = [showDone.value ? '已完成' : '未完成']
+  if (tagFilter.value.length) {
+    const names = allTags.value
+      .filter((t) => tagFilter.value.includes(t.id))
+      .map((t) => t.name)
+    if (names.length) filters.push(`标签：${names.join('、')}`)
+  }
+  const now = new Date()
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  const md = buildTodosMarkdown(
+    {
+      scope: scopeLabel,
+      time: `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${p2(now.getHours())}:${p2(now.getMinutes())}`,
+      filters,
+    },
+    groups.value.map((g) => ({ label: g.label, items: g.items.map((t) => toExportItem(t)) })),
+  )
+  let path: string | null = null
+  try {
+    // 保存对话框走 Rust 侧命令（plugin-dialog 的 JS save() 在 dev 的 localhost 页面
+    // 会被能力 ACL 拒绝且无任何反馈，表现为「点了没反应」；Rust 侧无此问题）
+    path = await tauriApi.pickSavePath(
+      sanitizeExportFilename(
+        `待办导出_${scopeLabel}_${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())}`,
+        'md',
+      ),
+    )
+  } catch (e) {
+    // 对话框都打不开必须明说，静默吞掉在用户眼里就是「点了没反应」
+    showToast(`无法打开保存对话框：${typeof e === 'string' ? e : String(e)}`)
+    return
+  }
+  if (typeof path !== 'string' || !path) return
+  exporting.value = true
+  try {
+    await tauriApi.exportTodos(path, md)
+    // toast 只回显文件名：完整路径是用户刚在对话框里选的，全路径在窄面板下占满整行
+    const fileName = path.split(/[\\/]/).pop() ?? path
+    showToast(`已导出 ${visible.value.length} 条 → ${fileName}`)
+  } catch (e) {
+    showToast(`导出失败：${typeof e === 'string' ? e : String(e)}`)
+  } finally {
+    exporting.value = false
+  }
+}
+
+// ---- 加日记（内联输入框，与工作台日记卡同一交互习惯） ----
+
+const diaryOpen = ref(false)
+const diaryDraft = ref('')
+const diarySaving = ref(false)
+const diaryInputEl = ref<HTMLTextAreaElement | null>(null)
+
+function toggleDiary() {
+  diaryOpen.value = !diaryOpen.value
+  if (diaryOpen.value) {
+    nextTick(() => {
+      const el = diaryInputEl.value
+      el?.focus()
+      el?.scrollIntoView({ block: 'nearest' })
+    })
+  }
+}
+
+/** 单行起、随内容长高；+2 补 border-box 上下边框（与 DiaryCard.autosize 同款） */
+function autosizeDiary() {
+  const el = diaryInputEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight + 2}px`
+}
+watch(diaryDraft, () => autosizeDiary())
+
+/** 日记标题 = 日历选中那天「YYYY年M月D日」：在这天明细下记的日记就归属这天 */
+function diaryTitleOfSelectedDay(): string {
+  const [y, m, d] = selectedDay.value.split('-').map(Number)
+  return `${y}年${m}月${d}日`
+}
+
+/** 回车存入速记「日记」文件夹（查找/建夹/落库统一在 store.saveDiaryEntry）；
+ *  成功清空可连记，失败保留原文；失焦不保存不收起（多行草稿保护，同日记卡只认显式回车） */
+async function saveDiary() {
+  const content = diaryDraft.value
+  if (diarySaving.value || !content.trim()) return
+  diarySaving.value = true
+  try {
+    await store.saveDiaryEntry(content, diaryTitleOfSelectedDay())
+    diaryDraft.value = ''
+    nextTick(autosizeDiary)
+    showToast('已存入速记「日记」文件夹')
+  } catch (e) {
+    console.error('save diary failed:', e)
+    showToast('日记保存失败，请重试')
+  } finally {
+    diarySaving.value = false
+  }
+}
+
+/** 回车保存（Shift+Enter 换行）；Esc 收起（IME 组合中不拦，留给取消选字）。收起保留草稿 */
+function onDiaryKeydown(e: KeyboardEvent) {
+  if (e.isComposing) return
+  if (e.key === 'Enter') {
+    if (e.shiftKey) return
+    e.preventDefault()
+    void saveDiary()
+  } else if (e.key === 'Escape') {
+    e.preventDefault()
+    diaryOpen.value = false
+  }
+}
+
+/** 日历当天明细里正在提交的那几条（防连点把同一条连续翻转两次，同 TodoRow 的 busy；
+ *  用集合而不是单个 id：同一时刻勾掉几条是正常操作，不该互相挡住） */
+const dayToggling = ref<Set<number>>(new Set())
+
+/**
+ * 点日历当天明细**前方圆点** = 完成/取消完成（行其余区域仍是打开编辑，见 template）。
+ * 勾父带子：有未完成子待办时先确认——静默连勾用户看不见（与行勾选同款弹窗，宿主层单实例）。
+ */
+function toggleDayTodo(t: Todo) {
+  if (!t.done) {
+    const undone = (kidsOf.value.get(t.id) ?? []).filter((k) => !k.done)
+    if (undone.length) {
+      rowConfirm.value = { todo: t, kids: undone.length, onConfirm: () => void applyDayToggle(t) }
+      return
+    }
+  }
+  void applyDayToggle(t)
+}
+
+async function applyDayToggle(t: Todo) {
+  if (dayToggling.value.has(t.id)) return
+  dayToggling.value = new Set(dayToggling.value).add(t.id)
+  try {
+    await applyToggleTodo(t)
+  } catch {
+    showToast('待办状态没能保存，请重试')
+  } finally {
+    const next = new Set(dayToggling.value)
+    next.delete(t.id)
+    dayToggling.value = next
+  }
 }
 
 /** 日历格子里日期徽标的逾期判定（行内的徽标由 TodoRow 自己算） */
@@ -545,6 +838,25 @@ function onVirtualDown(e: PointerEvent) {
             <h2>待办</h2>
           </div>
           <span class="tv-spacer"></span>
+          <button
+            type="button"
+            class="tv-ghost"
+            :disabled="!visible.length || exporting"
+            title="导出当前范围与标签筛选下的待办（Markdown）"
+            @click="exportTodos"
+          >
+            <Download :size="13" :stroke-width="2" />导出
+          </button>
+          <button
+            type="button"
+            class="tv-ghost tv-overdue"
+            :disabled="!overdueTodos.length"
+            title="把所有已过截止的未完成待办标记为完成"
+            @click="askCompleteOverdue"
+          >
+            <CheckCheck :size="13" :stroke-width="2" />一键完成逾期
+            <span v-if="overdueTodos.length" class="cnt">{{ overdueTodos.length }}</span>
+          </button>
           <button type="button" class="tv-primary" @click="openNew()">
             <Plus :size="14" :stroke-width="2.2" />新建待办
           </button>
@@ -601,7 +913,8 @@ function onVirtualDown(e: PointerEvent) {
           </button>
         </div>
 
-        <div ref="bodyRef" class="tv-scroll">
+        <!-- data-todo-list：子待办拖到本容器内的空白处 = 升为顶级（TodoRow 升挂落点判定范围） -->
+        <div ref="bodyRef" class="tv-scroll" data-todo-list>
           <p v-if="!groups.length" class="tv-empty">
             {{ tagFilter.length ? '没有符合所选标签的待办' : '这个范围里没有待办' }}
           </p>
@@ -659,7 +972,10 @@ function onVirtualDown(e: PointerEvent) {
             @click="selectedDay = c.key"
             @dblclick="openNew(new Date(`${c.key}T23:59:00`).getTime())"
           >
-            <span class="tv-day">{{ c.day }}</span>
+            <div class="tv-dayrow">
+              <span class="tv-day">{{ c.day }}</span>
+              <span v-if="calLabels.labels.get(c.key)" class="tv-lunar" :class="{ fest: calLabels.fests.has(c.key) }">{{ calLabels.labels.get(c.key) }}</span>
+            </div>
             <div class="tv-chips">
               <button
                 v-for="t in chipsOf(c.key).real"
@@ -705,7 +1021,7 @@ function onVirtualDown(e: PointerEvent) {
             :data-day="c.key"
             @click="selectedDay = c.key"
           >
-            <div class="tv-weekhead">{{ c.date.getMonth() + 1 }}/{{ c.date.getDate() }} 周{{ ['一', '二', '三', '四', '五', '六', '日'][(c.date.getDay() + 6) % 7] }}</div>
+            <div class="tv-weekhead">{{ c.date.getMonth() + 1 }}/{{ c.date.getDate() }} 周{{ ['一', '二', '三', '四', '五', '六', '日'][(c.date.getDay() + 6) % 7] }}<span v-if="calLabels.labels.get(c.key)" class="tv-lunar" :class="{ fest: calLabels.fests.has(c.key) }">{{ calLabels.labels.get(c.key) }}</span></div>
             <div class="tv-chips">
               <button
                 v-for="t in chipsOf(c.key).real"
@@ -746,6 +1062,7 @@ function onVirtualDown(e: PointerEvent) {
         <div class="tv-dayview">
           <div class="tv-dayview-h">
             <span class="tv-dayview-date">{{ selectedDayLabel }}</span>
+            <span v-if="selectedDayCal" class="tv-dayview-lunar">{{ selectedDayCal }}</span>
             <span class="cnt">{{ selectedTodos.length }}</span>
             <span class="tv-spacer"></span>
             <button
@@ -753,44 +1070,92 @@ function onVirtualDown(e: PointerEvent) {
               class="tv-ghost"
               @click="openNew(new Date(`${selectedDay}T23:59:00`).getTime())"
             >加待办</button>
+            <button
+              type="button"
+              class="tv-ghost"
+              :class="{ on: diaryOpen }"
+              :title="`记一条 ${selectedDayLabel} 的日记到速记「日记」文件夹`"
+              @click="toggleDiary"
+            >加日记</button>
           </div>
-          <p v-if="!selectedTodos.length" class="tv-dayview-empty">这天没有待办</p>
+          <!-- 日记内联输入：回车保存可连记，Shift+Enter 换行，Esc/× 收起；收起保留草稿 -->
+          <div v-if="diaryOpen" class="tv-diary-row">
+            <textarea
+              ref="diaryInputEl"
+              v-model="diaryDraft"
+              class="tv-diary-input"
+              :placeholder="`记点什么，回车存入速记「日记」· ${diaryTitleOfSelectedDay()}（Shift+Enter 换行）`"
+              rows="1"
+              spellcheck="false"
+              @keydown="onDiaryKeydown"
+            ></textarea>
+            <button
+              type="button"
+              class="tv-diary-close"
+              title="收起"
+              aria-label="收起日记输入"
+              @mousedown.prevent
+              @click="diaryOpen = false"
+            >
+              <X :size="12" :stroke-width="2.4" />
+            </button>
+          </div>
+          <p v-if="!selectedTodos.length && !diaryOpen" class="tv-dayview-empty">这天没有待办</p>
           <div v-else class="tv-dayview-list">
             <template v-if="selectedDayParts.undone.length">
               <p class="tv-dv-sub">
                 未完成 <span class="cnt">{{ selectedDayParts.undone.length }}</span>
               </p>
-              <button
+              <!-- 前方圆点 = 完成开关，右侧标题/时间 = 打开编辑：两个动作各有各的命中区，
+                   别再整行一键（整行点开编辑会把「勾掉」这件事挡死，用户报的就是这个） -->
+              <div
                 v-for="t in selectedDayParts.undone"
                 :key="t.id"
-                type="button"
                 class="tv-dayview-row"
-                :title="t.title"
-                @click="openEdit(t)"
               >
-                <span class="tv-dv-mark"></span>
-                <span class="tv-dv-title">{{ t.title }}</span>
-                <span class="tv-dv-time">{{ t.due_at ? fmtHM(t.due_at) : '' }}</span>
-              </button>
+                <button
+                  type="button"
+                  class="tv-dv-check"
+                  :disabled="dayToggling.has(t.id)"
+                  :title="`完成「${t.title}」`"
+                  :aria-label="`完成「${t.title}」`"
+                  @click="toggleDayTodo(t)"
+                ></button>
+                <button type="button" class="tv-dv-open" :title="t.title" @click="openEdit(t)">
+                  <span class="tv-dv-title">{{ t.title }}</span>
+                  <span class="tv-dv-time">{{ t.due_at ? fmtHM(t.due_at) : '' }}</span>
+                </button>
+              </div>
             </template>
             <template v-if="selectedDayParts.done.length">
               <p class="tv-dv-sub">
                 已完成 <span class="cnt">{{ selectedDayParts.done.length }}</span>
               </p>
-              <button
+              <div
                 v-for="t in selectedDayParts.done"
                 :key="t.id"
-                type="button"
                 class="tv-dayview-row done"
-                :title="`${t.title}（${doneMetaLabel(t, today)}）`"
-                @click="openEdit(t)"
               >
-                <span class="tv-dv-mark on">
+                <button
+                  type="button"
+                  class="tv-dv-check on"
+                  :disabled="dayToggling.has(t.id)"
+                  :title="`取消完成「${t.title}」`"
+                  :aria-label="`取消完成「${t.title}」`"
+                  @click="toggleDayTodo(t)"
+                >
                   <Check :size="11" :stroke-width="3" />
-                </span>
-                <span class="tv-dv-title">{{ t.title }}</span>
-                <span class="tv-dv-time">{{ doneRowTime(t) }}</span>
-              </button>
+                </button>
+                <button
+                  type="button"
+                  class="tv-dv-open"
+                  :title="`${t.title}（${doneMetaLabel(t, today)}）`"
+                  @click="openEdit(t)"
+                >
+                  <span class="tv-dv-title">{{ t.title }}</span>
+                  <span class="tv-dv-time">{{ doneRowTime(t) }}</span>
+                </button>
+              </div>
             </template>
           </div>
         </div>
@@ -824,6 +1189,16 @@ function onVirtualDown(e: PointerEvent) {
       confirm-text="删除标签"
       @confirm="confirmRemoveTag"
       @cancel="removingTag = null"
+    />
+
+    <!-- 一键完成逾期：批量改状态先确认，改完后「逾期」分组随 store 更新自动消退 -->
+    <ConfirmDialog
+      :visible="overdueConfirm"
+      title="一键完成逾期待办"
+      :message="overdueConfirmMessage"
+      confirm-text="全部完成"
+      @confirm="completeOverdue"
+      @cancel="overdueConfirm = false"
     />
   </section>
 </template>
@@ -979,6 +1354,11 @@ function onVirtualDown(e: PointerEvent) {
   opacity: 0.62;
 }
 .tv-ghost {
+  /* 图标 + 文字同行：Tailwind preflight 把 svg 设为 block，无 flex 的按钮里
+     图标会单独占一行（导出按钮曾因此图标在上、文字在下） */
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   padding: 4px 10px;
   font-size: 0.72rem;
   border: 1px solid var(--border-soft);
@@ -990,6 +1370,31 @@ function onVirtualDown(e: PointerEvent) {
 .tv-ghost.on {
   color: var(--text-1);
   border-color: var(--border-strong);
+}
+/* 一键完成逾期：图标 + 文案 + 计数同行；无逾期时置灰不可点 */
+.tv-overdue {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.tv-overdue .cnt {
+  font-weight: 400;
+  opacity: 0.62;
+}
+.tv-overdue:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+/* 导出按钮：图标 + 文案同行（与 tv-overdue 同排版） */
+.tv-export {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+/* ghost 按钮通用置灰：无可导出内容 / 导出中（tv-overdue 的专属规则同理） */
+.tv-ghost:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 .tv-body {
   flex: 1;
@@ -1168,6 +1573,8 @@ function onVirtualDown(e: PointerEvent) {
   border-radius: var(--radius-sm);
   background: var(--bg-card-solid);
   overflow: hidden;
+  /* 容器：农历小字按格子实际宽度逐级缩号/隐藏（见 .tv-lunar 的 @container 阶梯） */
+  container-type: inline-size;
 }
 .tv-cell.out {
   opacity: 0.45;
@@ -1189,6 +1596,47 @@ function onVirtualDown(e: PointerEvent) {
 .tv-day {
   font-size: 0.66rem;
   color: var(--text-3);
+}
+/* 格子顶行：日数字靠左、农历靠右（两端对齐，不贴着日数字） */
+.tv-dayrow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px;
+}
+/* 日历格顶行右侧的小字（节日 > 节气 > 农历，组合口径在 utils/lunar 的 calendarCellLabel）。
+ * 格子放不下时按容器宽度逐级缩字号，实在放不下才隐藏——缩字不裁字，
+ * white-space: nowrap 保证不折行挤占下方 chips 区（月/周视图共用）。 */
+.tv-lunar {
+  font-size: 0.6rem;
+  font-weight: 400;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+@container (max-width: 64px) {
+  .tv-lunar {
+    font-size: 0.55rem;
+  }
+}
+@container (max-width: 52px) {
+  .tv-lunar {
+    font-size: 0.5rem;
+  }
+}
+@container (max-width: 42px) {
+  .tv-lunar {
+    display: none;
+  }
+}
+/* 传统节日红字（日历惯例；节气/农历保持灰） */
+.tv-lunar.fest {
+  color: var(--c-red-ink);
+}
+/* 当天明细头部的标签（节日/节气/完整农历）：头部宽度充裕，不参与上面的缩号阶梯 */
+.tv-dayview-lunar {
+  font-size: 0.64rem;
+  font-weight: 400;
+  color: var(--text-4);
 }
 .tv-chips {
   display: flex;
@@ -1297,6 +1745,54 @@ function onVirtualDown(e: PointerEvent) {
   font-size: 0.72rem;
   color: var(--text-4);
 }
+/* 日记内联输入行：贴明细头下方展开，交互习惯与工作台日记卡一致（回车保存可连记） */
+.tv-diary-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.tv-diary-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border-soft);
+  background: var(--input-bg);
+  border-radius: var(--radius-md);
+  resize: none;
+  outline: none;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  font-family: inherit;
+  color: var(--text-2);
+  padding: 6px 8px;
+  overflow-y: auto;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.tv-diary-input:focus {
+  border-color: var(--brand-500);
+  box-shadow: var(--shadow-focus);
+  background: color-mix(in srgb, var(--input-bg) 88%, #fff);
+}
+.tv-diary-input::placeholder {
+  color: var(--text-4);
+}
+.tv-diary-close {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin-top: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-4);
+  cursor: pointer;
+}
+.tv-diary-close:hover {
+  color: var(--text-2);
+  background: var(--bg-card-soft);
+}
 .tv-dayview-list {
   display: flex;
   flex-direction: column;
@@ -1306,6 +1802,7 @@ function onVirtualDown(e: PointerEvent) {
   min-height: 0;
   overflow-y: auto;
 }
+/* 行本身不是按钮：命中区一分为二——左边圆点完成/取消，右边标题区打开编辑 */
 .tv-dayview-row {
   display: flex;
   align-items: center;
@@ -1315,28 +1812,58 @@ function onVirtualDown(e: PointerEvent) {
   font-size: 0.75rem;
   text-align: left;
   color: var(--text-1);
-  background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  cursor: pointer;
 }
 .tv-dayview-row:hover {
   background: var(--bg-card-soft);
 }
-.tv-dv-mark {
+/* 前方圆点 = 完成开关：尺寸与列表行的 .todo-check 取齐（18px，可点面积不打折），
+   视觉仍是原来的细描边圆点 */
+.tv-dv-check {
+  flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
   border: 1.5px solid var(--border-strong);
   border-radius: 50%;
-  color: #fff;
+  background: transparent;
+  color: var(--text-on-accent);
+  cursor: pointer;
+  transition: background 0.18s, border-color 0.18s, transform 0.18s;
 }
-.tv-dv-mark.on {
+.tv-dv-check:hover:not(:disabled) {
+  border-color: var(--brand-500);
+  background: var(--brand-50);
+}
+.tv-dv-check:active:not(:disabled) {
+  transform: scale(0.9);
+}
+.tv-dv-check.on {
   background: var(--brand-500);
   border-color: var(--brand-500);
+}
+.tv-dv-check:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+/* 标题/时间区：点它打开编辑弹窗（铺满圆点右侧，空白处也落在它身上） */
+.tv-dv-open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 .tv-dv-title {
   flex: 1;
@@ -1393,11 +1920,17 @@ function onVirtualDown(e: PointerEvent) {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
   background: var(--bg-card-solid);
+  /* 容器：同 .tv-cell，供周列头农历的 @container 缩号阶梯用 */
+  container-type: inline-size;
 }
 .tv-weekcol.today {
   border-color: var(--brand-500);
 }
 .tv-weekhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px;
   font-size: 0.64rem;
   font-weight: 700;
   color: var(--text-3);

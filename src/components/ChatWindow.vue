@@ -11,17 +11,20 @@ import { listen } from '@tauri-apps/api/event'
 import { Pin, PinOff, X } from 'lucide-vue-next'
 import ChatPanel from './ChatPanel.vue'
 import { isTauri, tauriApi } from '../api/tauri'
-import { applyTheme, useTheme } from '../composables/useTheme'
-import { useStore } from '../stores/workbench'
+import { applyTheme } from '../composables/themeCore'
+import { useShellThemeConfig } from '../composables/useShellThemeConfig'
+import { useScrollbarHover } from '../composables/useScrollbarHover'
+import { hasFloatingSurface } from '../utils/floatingSurface'
 
-const store = useStore()
 const panelRef = ref<InstanceType<typeof ChatPanel> | null>(null)
 const pinned = ref(false)
 const appWindow = isTauri() ? getCurrentWindow() : null
 
-// 主题三轴 + 字号缩放：启动自取（独立 WebView 不经过主窗 store 初始化链路），
-// 运行时由主窗 useTheme 的 chat-theme 推送跟随
-useTheme()
+// 主题三轴 + 字号缩放：轻量壳窗口（chat.html）不加载 store，走 get_ui_config 自举
+// （口径与主窗 useTheme 逐条对齐）；运行时跟随主窗 useTheme 的 chat-theme 推送。
+const shellTheme = useShellThemeConfig()
+// 消息列表/输入区有滚动，滚动条 hover 显隐要显式接（原先靠 App.vue 那段统一挂）
+useScrollbarHover()
 document.documentElement.dataset.chatWindow = ''
 
 // ---- 窗内轻提示：ChatPanel 的「未配置模型」等提示经此渲染（主窗的 provide 到这里不可见） ----
@@ -45,10 +48,11 @@ onMounted(async () => {
   // 拖动收尾监听挂 window：按住标题栏移出元素后仍能收到 move/up（见下方拖动注释）
   window.addEventListener('mousemove', onWinMouseMove)
   window.addEventListener('mouseup', onWinMouseUp)
+  window.addEventListener('keydown', onWinKeydown)
   try {
-    // 主题的唯一来源是 useTheme 对 config 三件套的 watch：refreshConfig 更新 config
-    // 即触发 applyTheme，不再直调 getThemeConfig（避免同一主题应用多遍）
-    await store.refreshConfig()
+    // 主题的唯一来源是 useShellThemeConfig 对 config 的 watch：refresh 更新 config
+    // 即触发 applyTheme/字号/玻璃全套，不再直调 getThemeConfig（避免同一主题应用多遍）
+    await shellTheme.refresh()
   } catch {
     // 忽略：命令未就绪时用默认配置渲染
   }
@@ -66,7 +70,7 @@ onMounted(async () => {
   // （只拉 config，业务数据由 ChatPanel.refresh 自己拉，不整库搬运）
   unlistenShown = await listen('chat-window-shown', async () => {
     try {
-      await store.refreshConfig()
+      await shellTheme.refresh()
       const st = await tauriApi.chatWindowGetState()
       pinned.value = st.pinned
     } catch {
@@ -80,12 +84,22 @@ onMounted(async () => {
   unlistenHidden = await listen('chat-window-hidden', () => {
     panelRef.value?.unload()
   })
+  // 启动预创建时窗口是隐藏的，ChatPanel 挂载仍会拉会话/消息（长会话几十 MB）。
+  // 此时立刻卸载，首次唤起由 chat-window-shown → refresh() 重拉，行为不变。
+  let visible = false
+  try {
+    visible = (await appWindow?.isVisible()) ?? false
+  } catch {
+    visible = false
+  }
+  if (!visible) panelRef.value?.unload()
 })
 
 onBeforeUnmount(() => {
   if (toastTimer) clearTimeout(toastTimer)
   window.removeEventListener('mousemove', onWinMouseMove)
   window.removeEventListener('mouseup', onWinMouseUp)
+  window.removeEventListener('keydown', onWinKeydown)
   unlistenTheme?.()
   unlistenShown?.()
   unlistenHidden?.()
@@ -131,6 +145,15 @@ async function togglePin() {
 async function onClose() {
   if (!isTauri()) return
   await tauriApi.chatWindowClose().catch(() => {})
+}
+
+// ESC = 关闭面板窗口：与会话菜单/下拉/弹窗的 ESC 让行（ChatPanel 自己先收起菜单）。
+// 浮层判定与主窗共用 utils/floatingSurface.ts 一份口径
+function onWinKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return
+  if (hasFloatingSurface()) return
+  e.preventDefault()
+  void onClose()
 }
 
 // 「模型设置」→ 唤出主窗并定位到设置 → AI 助手 → 供应商；section="account" = 账号页（积分入口用）

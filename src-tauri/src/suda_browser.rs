@@ -49,6 +49,18 @@ const WIN_PREFIX: &str = "suda-web";
 const DEFAULT_CHROME_HEIGHT: f64 = 48.0;
 const DEFAULT_WIN_W: f64 = 1024.0;
 const DEFAULT_WIN_H: f64 = 720.0;
+/// 面板预创建占位尺寸（逻辑 px）。隐藏态停泊在客户区外，尺寸本身无意义，仅留个非零形状
+const PANEL_PLACEHOLDER_W: f64 = 200.0;
+const PANEL_PLACEHOLDER_H: f64 = 120.0;
+/// 面板隐藏态的界外停泊位（逻辑 px，负坐标 = 父窗客户区左上角之外）。
+/// 子 webview 被父窗客户区裁剪：界外即不可见、也不参与命中测试。停泊是 hide() 的硬兜底——
+/// 预创建后的 hide() 在部分 WebView2 运行时上会静默失效（2026-11 实测：面板以 (0,0) 200×120
+/// 占位矩形悬在主窗左上角，透明 about:blank 不显形，但 HWND 树吞掉该区域全部鼠标事件，
+/// 侧栏「工作台/待办」两个按钮恰好被整个盖住点不到）；而 tauri 的 WebviewBuilder 又没暴露
+/// visible(false) 构造项，创建瞬间必是可见的。所以隐藏态一律停泊界外，可见性开关只作锦上添花；
+/// 显示路径 set_bounds 先行（suda_panel_show / suda_panel_bounds），不受停泊影响
+const PANEL_PARK_X: f64 = -1200.0;
+const PANEL_PARK_Y: f64 = -800.0;
 
 struct SlotState {
     tabs: Vec<String>,
@@ -119,13 +131,39 @@ fn about_blank() -> Url {
 // 启动期预创建（铁律：全工程唯一的 suda 浏览器 webview 创建点）
 // ---------------------------------------------------------------------------
 
-/// lib.rs setup 调用：预创建面板 webview + POOL_SIZE 个池窗口（全部隐藏常驻）
+/// lib.rs setup 调用：预创建主窗内嵌面板 webview。
+/// 独立浏览器池窗口**不预创建**（2026-11 内存优化）：每个池窗口含 chrome+content
+/// 两个 renderer（约 30–60MB），而默认「面板打开」模式根本用不到；首次点
+/// 「在独立窗口打开」时才建（open_in_pool 内 ensure_pool_windows），建好后常驻复用。
 pub fn init(app: &AppHandle) {
     ensure_slots();
     init_panel(app);
+}
+
+/// 确保 POOL_SIZE 个独立窗口都存在（首次打开独立窗口时调用；已存在则跳过）。
+/// 建窗消息由主循环异步执行，这里在调用线程（async 命令线程 / 后台线程）短等，
+/// 别把「消息刚投递、窗口还没建出来」误判为失败。
+fn ensure_pool_windows(app: &AppHandle) -> Result<(), String> {
     for i in 0..POOL_SIZE {
+        if app.get_window(&win_label(i)).is_some() {
+            continue;
+        }
         init_pool_window(app, i);
+        let mut ready = false;
+        for _ in 0..20 {
+            if app.get_window(&win_label(i)).is_some() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !ready {
+            return Err(format!(
+                "创建应用内浏览器窗口失败（slot {i}），请重试或改用系统浏览器打开"
+            ));
+        }
     }
+    Ok(())
 }
 
 fn init_panel(app: &AppHandle) {
@@ -154,11 +192,15 @@ fn init_panel(app: &AppHandle) {
         });
     match main.add_child(
         builder,
-        LogicalPosition::new(0.0, 0.0),
-        LogicalSize::new(200.0, 120.0),
+        // 预创建落点直接给界外停泊位：不再以 (0,0) 200×120 悬在主窗左上角（hide 一失效就盖住侧栏）
+        LogicalPosition::new(PANEL_PARK_X, PANEL_PARK_Y),
+        LogicalSize::new(PANEL_PLACEHOLDER_W, PANEL_PLACEHOLDER_H),
     ) {
         Ok(wv) => {
-            let _ = wv.hide();
+            park_panel(&wv);
+            if let Err(e) = wv.hide() {
+                log::warn!("速达网页面板预创建 hide 失败（已由界外停泊兜底）: {e}");
+            }
             log::info!("速达网页面板 webview 预创建完成");
         }
         Err(e) => log::warn!("速达网页面板 webview 预创建失败: {e}"),
@@ -406,9 +448,11 @@ pub struct OpenResult {
     pub reused: bool,
 }
 
-/// 打开速达网页资源到独立应用内浏览器（URL 取自数据库：仅 Web 类型 + http/https）
+/// 打开速达网页资源到独立应用内浏览器（URL 取自数据库：仅 Web 类型 + http/https）。
+/// 必须是 async 命令：首次打开时要在运行期建池窗口，若在主线程上同步 build
+/// WebView2 会卡死消息泵；async 命令跑在异步运行时线程，建窗消息投递回主循环执行。
 #[tauri::command]
-pub fn suda_browser_open(
+pub async fn suda_browser_open(
     app: AppHandle,
     state: State<'_, DbState>,
     id: i64,
@@ -426,16 +470,28 @@ pub fn suda_browser_open(
     open_in_pool(&app, &url)
 }
 
-/// 按 URL 打开（面板「转独立窗口」、chrome 页新窗口接管等入口）
+/// 按 URL 打开（面板「转独立窗口」、chrome 页新窗口接管等入口）。
+/// async 理由同 suda_browser_open：首次可能要在运行期建池窗口。
 #[tauri::command]
-pub fn suda_browser_open_url(app: AppHandle, url: String) -> Result<OpenResult, String> {
+pub async fn suda_browser_open_url(app: AppHandle, url: String) -> Result<OpenResult, String> {
     let url = validate_web_url(&url)?;
     open_in_pool(&app, &url)
+}
+
+/// 同步上下文（扩展 API）用：后台线程打开，不阻塞调用线程
+pub(crate) fn spawn_open_url(app: AppHandle, url: String) {
+    std::thread::spawn(move || {
+        if let Err(e) = validate_web_url(&url).and_then(|u| open_in_pool(&app, &u).map(|_| ())) {
+            log::warn!("扩展链接在应用内浏览器打开失败（{url}）: {e}");
+        }
+    });
 }
 
 /// 池选路：① 同地址复用 → ② 最近显示的可见窗口开新 tab → ③ 空闲窗口 → ④ POOL_FULL
 fn open_in_pool(app: &AppHandle, url: &str) -> Result<OpenResult, String> {
     ensure_slots();
+    // 池窗口按需创建（默认面板模式不会走到这里）；首次「在独立窗口打开」多一次建窗
+    ensure_pool_windows(app)?;
 
     // ① 同地址复用（完整 URL 精确匹配起步，ADR 0011 可逆默认）
     let reuse = {
@@ -711,6 +767,18 @@ fn set_panel_bounds(wv: &Webview, x: f64, y: f64, w: f64, h: f64) -> Result<(), 
     .map_err(err_str)
 }
 
+/// 面板隐藏态界外停泊：挪出父窗客户区（负坐标），即使 hide() 失效也吃不到鼠标输入
+/// （PANEL_PARK_* 常量注释有完整事故记录）。失败只落日志：停泊是兜底，不该打断 hide 主流程
+fn park_panel(wv: &Webview) {
+    let rect = tauri::Rect {
+        position: tauri::Position::Logical(LogicalPosition::new(PANEL_PARK_X, PANEL_PARK_Y)),
+        size: tauri::Size::Logical(LogicalSize::new(PANEL_PLACEHOLDER_W, PANEL_PLACEHOLDER_H)),
+    };
+    if let Err(e) = wv.set_bounds(rect) {
+        log::warn!("速达网页面板界外停泊失败: {e}");
+    }
+}
+
 /// 打开速达网页资源到内嵌面板（URL 取自数据库：仅 Web 类型 + http/https）
 #[tauri::command]
 pub fn suda_panel_show(
@@ -749,9 +817,15 @@ pub fn suda_panel_bounds(app: AppHandle, x: f64, y: f64, w: f64, h: f64) -> Resu
 #[tauri::command]
 pub fn suda_panel_hide(app: AppHandle) -> Result<(), String> {
     let wv = panel_webview(&app)?;
-    wv.hide().map_err(err_str)?;
-    // 复位到空白页卸掉已访问页面（同 hide_slot：下次打开必然重新 navigate）
-    wv.navigate(about_blank()).map_err(err_str)
+    if let Err(e) = wv.hide() {
+        // 不作失败返回：界外停泊（下方）已保证吃不到输入，面板不可见才是用户可感知的契约
+        log::warn!("速达网页面板 hide 失败（已由界外停泊兜底）: {e}");
+    }
+    // 停泊先行：navigate 失败（WebView2 崩溃等异常态）提前返回时，「不可见」契约也已成立；
+    // 再复位到空白页卸掉已访问页面（同 hide_slot：下次打开必然重新 navigate）
+    park_panel(&wv);
+    wv.navigate(about_blank()).map_err(err_str)?;
+    Ok(())
 }
 
 /// 面板地址栏导航（无资源 id，不写最近使用）

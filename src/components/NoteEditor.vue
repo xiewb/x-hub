@@ -10,6 +10,7 @@ import type { Ctx } from '@milkdown/kit/ctx'
 import { LanguageDescription, type LanguageSupport } from '@codemirror/language'
 import { languages as cmLanguages } from '@codemirror/language-data'
 import { imageBlockSchema } from '@milkdown/kit/component/image-block'
+import { listItemBlockConfig } from '@milkdown/kit/component/list-item-block'
 import { codeBlockSchema, remarkLineBreak } from '@milkdown/kit/preset/commonmark'
 import { createTable } from '@milkdown/kit/preset/gfm'
 import { Fragment, Slice, type Node as ProseNode, type Schema } from '@milkdown/kit/prose/model'
@@ -26,7 +27,7 @@ import {
 import { useStore } from '../stores/workbench'
 import { normalizeShortcutDisplay } from '../composables/useShortcutRecorder'
 import { attachBlockDrag } from '../utils/blockDrag'
-import { guessCodeLanguage, looksLikeCode, normalizeClipboardText, unwrapFencedCode } from '../utils/pasteCode'
+import { guessCodeLanguage, hasMarkdownSyntax, looksLikeCode, normalizeClipboardText, splitPlainTextLines, unwrapFencedCode } from '../utils/pasteCode'
 import { beautifyNoteMarkdown } from '../utils/markdownBeautify'
 import { copyPlainText } from '../utils/clipboardPlainText'
 import { restoreNoteImageSyntax } from '../utils/noteImageSyntax'
@@ -203,7 +204,7 @@ async function destroyEditor() {
 
 /** 公共 Crepe 配置：主编辑区与分屏预览共用同一份，保证两个实例渲染完全一致 */
 function buildCrepe(root: HTMLElement, content: string): Crepe {
-  const c = new Crepe({
+  const crepe = new Crepe({
     root,
     // 空行数量保真：装载侧先把 m 个连续空行展开成 (m−1) 个零宽空段落，
     // Crepe 解析后预览/编辑区就能看到与源码等量的空行
@@ -300,10 +301,23 @@ function buildCrepe(root: HTMLElement, content: string): Crepe {
   // 单换行修复（fork）：让段落内 text 的 \n 解析为 hardbreak（视觉换行），
   // 序列化仍输出干净的单换行，与实时预览 marked {breaks:true} 的语义一致，
   // 消除源码↔预览来回切换产生的空行
-  c.editor.use(remarkLineBreak)
+  crepe.editor.use(remarkLineBreak)
   // ==高亮== 扩展（fork）：remark 双向 transformer + mark schema
-  c.editor.use(forkHighlightRemark).use(highlightMark)
-  return c
+  crepe.editor.use(forkHighlightRemark).use(highlightMark)
+  // Crepe 的任务标签在 checked 有值时只画勾选框，有序列表的「1.」被丢掉。
+  // 解析结果里 label / listType 还在，这里把序号拼回勾选框前面。实时预览和分屏预览都走 buildCrepe。
+  crepe.editor.config((ctx) => {
+    ctx.update(listItemBlockConfig.key, (prev) => ({
+      ...prev,
+      renderLabel: (props) => {
+        const icon = prev.renderLabel(props)
+        if (props.checked == null || props.listType !== 'ordered') return icon
+        const num = (props.label ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        return `<span class="ol-task-no">${num}</span>${icon}`
+      },
+    }))
+  })
+  return crepe
 }
 
 async function mountEditor(content: string) {
@@ -416,15 +430,59 @@ function attachCodePasteListener(root: HTMLElement, view: EditorView): () => voi
     const text = normalizeClipboardText(cd.getData('text/plain'))
     if (!text) return
     const fenced = unwrapFencedCode(text)
-    if (!fenced && !looksLikeCode(text)) return
-    event.preventDefault()
-    event.stopPropagation()
-    const code = fenced ? fenced.code : text.replace(/\n+$/, '')
-    const language = fenced ? fenced.language : guessCodeLanguage(code)
-    insertPastedCodeBlock(view, code, language)
+    if (fenced || looksLikeCode(text)) {
+      event.preventDefault()
+      event.stopPropagation()
+      const code = fenced ? fenced.code : text.replace(/\n+$/, '')
+      const language = fenced ? fenced.language : guessCodeLanguage(code)
+      insertPastedCodeBlock(view, code, language)
+      return
+    }
+    // 无 HTML 的多行纯文本：Milkdown 会把它当 Markdown 解析，单换行被折成空格（软换行），
+    // 三行文字粘进来会并成一行。带 Markdown 语法的仍走默认解析；纯文字则按原样还原行。
+    const html = cd.getData('text/html')
+    if (!html.trim() && text.includes('\n') && !hasMarkdownSyntax(text)) {
+      event.preventDefault()
+      event.stopPropagation()
+      insertPastedPlainText(view, text)
+    }
   }
   root.addEventListener('paste', onPaste, true)
   return () => root.removeEventListener('paste', onPaste, true)
+}
+
+/**
+ * 把多行纯文本按「一行一段落」插入——结构与手敲回车得到的完全一致，行距也就一致。
+ *
+ * ⚠️ **不要用硬换行（hardbreak）拼段内换行**：Crepe 的段落是
+ * `.milkdown .ProseMirror p { line-height: 1.5; padding: 4px 0 }`（theme/common/reset.css），
+ * 段落之间自带 4+4px 间距；hardbreak 只是行内换行，同一段里堆多行会比手敲的紧一半
+ * （2026-11-05 用户反馈「粘贴的行距和手输的不一致」）。顺带：硬换行节点在 Crepe 里叫
+ * `hardbreak`（不是 prosemirror 基线的 `hard_break`），取错名字还会静默丢掉换行——
+ * 复制方向同款坑见 utils/clipboardPlainText.ts。
+ *
+ * 空行（连续空行合并成一行）落成空段落 = 手敲两次回车留下的空行，落库时由
+ * normalizeEmptyParagraphs 补零宽空格占位。**首尾的空行直接丢弃**：`splitPlainTextLines`
+ * 对 `"\n\na"` 会给出 `[[""], ["a"]]`，首个空 block 已经代表"开头就是空行"，若再按
+ * 「非首块补一个分隔空段落」的规则补一次，就会凭空多出两行空白。单事务提交，
+ * 一次 Ctrl+Z 可整体撤销。
+ */
+function insertPastedPlainText(view: EditorView, raw: string) {
+  const { schema } = view.state
+  const paragraph = schema.nodes.paragraph
+  if (!paragraph) return
+  // 丢掉纯空白的 block（开头的空行不需要表达成空段落），剩下的才是真正的段落组
+  const blocks = splitPlainTextLines(raw).filter((lines) => lines.some((line) => line.trim() !== ''))
+  if (!blocks.length) return
+  const nodes: ProseNode[] = []
+  blocks.forEach((lines, bi) => {
+    if (bi > 0) nodes.push(paragraph.create(null))
+    for (const line of lines) {
+      nodes.push(paragraph.create(null, line ? schema.text(line) : undefined))
+    }
+  })
+  const slice = new Slice(Fragment.fromArray(nodes), 0, 0)
+  view.dispatch(view.state.tr.replaceSelection(slice).scrollIntoView())
 }
 
 // ---- 分屏预览：右侧挂一个只读 Crepe（同一渲染器 = 与编辑/仅预览格式一致），源码侧防抖同步 ----
@@ -649,6 +707,46 @@ function syncLocal() {
   dirty.value = false
 }
 
+// 外部改写落地中：记住刚灌进编辑器的正文，用来吞掉由此引发的那次 markdownUpdated。
+// 用内容而不是布尔：Crepe 的 markdownUpdated 可能在一个微任务后才到，布尔在 finally
+// 里已复位，挡不住迟到的回调（会导致把刚拉进来的正文再排一次保存）。
+let externalAppliedContent: string | null = null
+
+/**
+ * 同一篇笔记被**外部**改写后的就地重载（AI 助手工具 / 云同步 / 剪贴板浮层写库）。
+ *
+ * 这些写入走 Rust 直写库 + `notes-changed`，store.refreshNotes 会把新正文拉进
+ * `props.note`；但编辑器此前只在 id 变化时重挂，同一 id 的正文更新无人接管——
+ * 用户打开着那篇笔记时看不到外部写进来的内容（2026-11-04 排查「AI 记录的速记
+ * 要重启才出现」的界面侧一半）。
+ *
+ * **本地有未保存编辑时不覆盖**（用户输入优先）：600ms 防抖窗口里的字比远端新，
+ * 抢过来覆盖会让用户当场丢字。此时等用户的保存把内容写回去，远端那份自然被覆盖，
+ * 与「最后写入者胜」的既有口径一致。
+ */
+function applyExternalNoteUpdate() {
+  const note = props.note
+  if (!note) return
+  if (dirty.value || saveTimer) return
+  // 标题只认真正的外部改名：空标题落库时会被归一成「无标题笔记」（normalizeTitle），
+  // 那是自己保存的回写，不能把用户刚清空的输入框顶掉
+  const titleChanged = note.title !== localTitle.value && note.title !== normalizeTitle(localTitle.value)
+  const contentChanged = note.content !== localContent.value
+  if (!titleChanged && !contentChanged) return
+  if (titleChanged) localTitle.value = note.title
+  if (contentChanged) {
+    localContent.value = note.content
+    lastNoteId = note.id
+    if (isLiveMode(mode.value) && crepe) {
+      // 实时预览/仅预览共用实例：整篇替换（单事务），失败就交给重挂兜底
+      externalAppliedContent = note.content
+      if (!replaceWholeDocWithMarkdown(note.content)) void mountEditor(note.content)
+    }
+    // 源码/分屏：textarea 的 :value 直接绑 localContent，赋值即生效；
+    // 分屏右侧预览由 localContent 的 watch 300ms 防抖跟进
+  }
+}
+
 /** 立即落盘防抖中未保存的编辑（若存在），并取消挂起的定时器 */
 function flushPendingSave() {
   if (!saveTimer) return
@@ -668,6 +766,16 @@ function normalizeTitle(title: string): string {
 
 function onEdited(markdown: string) {
   if (!props.note || mode.value !== 'wysiwyg') return
+  // 外部改写引起的整篇替换不是用户输入：放过这一发，否则会把刚拉进来的正文再排一次保存。
+  // Crepe 序列化会加转义/改写列表符，所以比对要先过 restoreCrepeMarkdown 再和原文比。
+  if (externalAppliedContent != null) {
+    const incoming = restoreCrepeMarkdown(markdown)
+    const wasExternal = incoming === externalAppliedContent
+    // 无论是否命中都只守这一次：Crepe 若不产出回写（内容序列化后等价），
+    // 留着标记会误吞用户后来的第一次真实编辑
+    externalAppliedContent = null
+    if (wasExternal) return
+  }
   // Crepe 序列化会加上 \[ \* 并把列表/分隔线改写成星号。收回来再存，切到分屏才和实时预览一致。
   // 必须同样过 normalizeEditorMarkdown：markdownUpdated 是 wysiwyg 的主保存路径，
   // 上一版只在 captureCrepeMarkdown（取文落盘）规范化，这里漏掉导致源码模式仍多出
@@ -2231,11 +2339,28 @@ function scheduleSave() {
 // 切笔记时 id 也变了，绝不能在这里清：本 watch 默认 flush:'pre'，会先于下面那个
 // flush:'post' 的切笔记 watch 执行，dirty 被清成 false 后 flushLeavingNote 会直接返回，
 // 最后一整段 600ms 防抖窗口内的编辑就此静默丢失（切笔记丢字）。
+//
+// ⚠️ 同一 id 的 updated_at 也可能来自**外部写入**（AI 助手工具 / 云同步），不全是自己保存
+// 的回写。此时若把 dirty 清掉，用户的未保存编辑就再也不会落盘（静默丢字）。判据加一道
+// 「正文确实变成了我刚编辑的那份」——只有回写的正文与本地一致才算自己保存成功。
 watch(
   () => [props.note?.id, props.note?.updated_at] as const,
   ([id], [prevId]) => {
-    if (id === prevId) dirty.value = false
+    if (id !== prevId) return
+    if (props.note && props.note.content === localContent.value) dirty.value = false
   },
+)
+
+// 同一篇被外部改写 → 就地重载正文（见 applyExternalNoteUpdate）。
+// 用 flush:'post'：等本轮渲染把新的 props.note.content 落定再灌进编辑器。
+// 它不碰 dirty，用户有未保存编辑时函数内部直接跳过。
+watch(
+  () => [props.note?.id, props.note?.updated_at] as const,
+  ([id, updatedAt], prev) => {
+    if (!prev || id !== prev[0] || updatedAt === prev[1]) return
+    applyExternalNoteUpdate()
+  },
+  { flush: 'post' },
 )
 
 // ---- 来源链接（剪藏笔记展示原文出处，ADR 0014 口径：source_url 存在才显示） ----
@@ -3450,6 +3575,20 @@ function onEditorAreaMouseDown(e: MouseEvent) {
   scrollbar-gutter: stable;
 }
 
+/* 正文溢出时常显滚动条滑块：全局滚动条是「悬停可滚动区域才显示」（App.vue 靠 pointermove
+   加 .scrollbar-hover），但滚轮读长文时指针不动，永远等不到那次 move——内容太长却全程
+   看不到滚动条。编辑器两个正文滚动容器（wysiwyg/预览的 .milkdown 与源码 textarea）
+   改为溢出即常显滑块，样式沿用全局滚动条同款（40% text-3 圆角胶囊）；悬停滑块提亮
+   （50%）与轨道悬停显底色仍走全局规则 */
+.crepe-root :deep(.milkdown)::-webkit-scrollbar-thumb,
+.md-source::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--text-3) 40%, transparent);
+}
+.crepe-root :deep(.milkdown)::-webkit-scrollbar-thumb:hover,
+.md-source::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--text-3) 50%, transparent);
+}
+
 /* 斜杠菜单隐藏态用 visibility 隐藏而非 display:none：Crepe 定位用的 floating-ui
    flip() 在菜单 display:none 时量到 0 高度 → 判定“放得下”而从不翻转，编辑框贴近
    窗口底部时菜单就贴着下方被截断。保持元素可测量，flip 才能在下方不足时翻到光标上方。
@@ -4125,6 +4264,32 @@ function onEditorAreaMouseDown(e: MouseEvent) {
 <style>
 /* Crepe 主题变量对齐应用设计令牌（全局块：高优先级选择器压过 frame.css 的 .milkdown 定义）。
    亮色基线 + [data-theme="dark"] 暗色覆盖，替代 Crepe 缺失的动态主题切换（Milkdown #1839） */
+/* 有序任务项：序号和勾选框并排。默认标签槽只有 24px，只够放下勾选框。 */
+.crepe-root .milkdown .milkdown-list-item-block li .label-wrapper:has(.ol-task-no) {
+  width: auto;
+  min-width: 24px;
+}
+.crepe-root .milkdown .milkdown-list-item-block li .label-wrapper .label:has(.ol-task-no) {
+  width: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+.crepe-root .milkdown .ol-task-no {
+  min-width: 1.25em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  line-height: 1;
+  font-size: 0.875em;
+}
+.crepe-root .milkdown .ol-task-no + svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
 .crepe-root .milkdown {
   --crepe-base-font-size: calc(15px * var(--fs-notes, 1));
   --crepe-color-background: transparent;
